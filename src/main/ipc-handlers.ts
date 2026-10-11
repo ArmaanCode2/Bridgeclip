@@ -1,0 +1,414 @@
+import { openEditor, saveEditor, runEditor, cancelEditor, replaceEditorSource } from './clip-editor'
+import { anyEditorOperation, editorCloseReady, freeEditorMedia, readEditorProgress } from './clip-editor'
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { existsSync, realpathSync } from 'fs'
+import { loadSettings, publicSettings, replaceApiKey, savePublicSettings, type ApiKeyName, type PublicSettings } from './settings-store'
+import { getJobHistory, getJobOutput, generateThumbnail } from './file-manager'
+import { measureOutputStorage } from './output-storage'
+import { inspectEdits } from './edit-inspector'
+import { getEnginePath, getBridgeRunnerPath, hasActiveJobs, resolvePythonPath, runtimeEnvironment, validatePython } from './pipeline-runner'
+import { checkLocalWhisper, testAiProvider } from './provider-checks'
+import { deleteWhisperModel, listWhisperModels } from './whisper-models'
+import { cancelWhisperSetup, downloadWhisperModel, enableWhisperGpu, whisperSetupRunning, whisperSetupState, type SetupDeps } from './whisper-setup'
+import type { WhisperSetupProgress } from '../shared/whisper-models'
+import { cancelTrackedJob, dismissJob, initJobManager, listJobs, liveJobIds } from './job-manager'
+import { startClipJobRequest } from './job-start'
+import { logger, getLogFilePath } from './logger'
+import { assertAbsolutePath, assertMediaPath, assertTrustedSender, authorizeMedia, isTrustedExternalUrl, isWebUrl, isWithinDirectory, openAuthorizedMedia } from './security'
+import { getModelCatalog } from './openrouter-models'
+import { getYouTubePreview } from './youtube-preview'
+import { resolveBinary, supportsCaptionFilter } from './tools'
+import { automationEnhancementGroups, enhanceAutomationBatch, automationContentSource, enhanceAutomationContent, resolveAutomationMetadataDraft, addAutomationContent, addLibraryClipsToAutomation, createAutomation, deleteAutomation, isAutomationMedia, listAutomations, removeAutomationContent, runAutomation, updateAutomation, updateAutomationContent, approveAutomationTikTokReview, prepareAutomationTikTokReview } from './automations'
+import { acknowledgeAutomationWarnings, retryAutomationContent, dismissAutomationMetadataError, automationLibraryClip, reorderAutomationContent, reviewAutomationContent, showAutomationContentInFolder } from './automations'
+import { libraryPostingStatus, libraryMetadataSource, enhanceLibraryMetadata } from './library-posting'
+import { libraryPostingSummary } from './library-posting'
+import { deleteLibraryClips, deleteLibraryRun, setLibraryFavorite, setLibraryPosted } from './library-management'
+import {
+  cancelZernioConnect,
+  connectZernioAccount,
+  createZernioProfile,
+  disconnectZernioAccount,
+  getPendingZernioConnect,
+  getZernioOverview,
+  readCachedOverview,
+  resetZernioState,
+  syncZernioAccounts,
+  checkZernioStatus
+} from './zernio/service'
+import {
+  cancelPost,
+  cancelUpload,
+  dismissPost,
+  getTikTokCreatorInfo,
+  listPosts,
+  openPostLink,
+  openTikTokLegal,
+  probeClipForPosting,
+  publishClip,
+  refreshPosts,
+  reschedulePost,
+  retryPost
+} from './zernio/posts'
+
+export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): void {
+  const selectedOutputDirectories = new Set<string>()
+  initJobManager(getMainWindow)
+  const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, (event, ...args) => {
+    assertTrustedSender(event, getMainWindow())
+    return listener(event, ...args)
+  })
+  handle('settings:load', () => {
+    return publicSettings(loadSettings())
+  })
+  handle('settings:storageUsage', (_event, fresh: unknown = false) => measureOutputStorage(loadSettings().outputDirectory, { fresh: fresh === true }))
+  handle('models:list', (_event, refresh: unknown = false) => getModelCatalog(refresh))
+  handle('source:youtubePreview', (_event, source: unknown, details: unknown = false) => getYouTubePreview(source, details))
+
+  handle('settings:save', (_event, settings: PublicSettings) => {
+    const current = loadSettings()
+    if (!settings || typeof settings !== 'object') throw new Error('Invalid settings')
+    if (typeof settings.outputDirectory !== 'string' || typeof settings.pythonPath !== 'string' || typeof settings.customVocabulary !== 'string') throw new Error('Invalid settings')
+    if (settings.outputDirectory !== current.outputDirectory && !selectedOutputDirectories.has(settings.outputDirectory)) throw new Error('Choose the output folder with the folder picker')
+    if (app.isPackaged && settings.pythonPath !== current.pythonPath) throw new Error('Runtime paths cannot be changed in packaged builds')
+    return savePublicSettings(settings)
+  })
+
+  handle('settings:replaceApiKey', (_event, key: ApiKeyName, value: string) => {
+    const previousZernioKey = key === 'zernioApiKey' ? loadSettings().zernioApiKey : null
+    const saved = replaceApiKey(key, value)
+    // A different Zernio key may be a different workspace; drop the old one's accounts.
+    if (previousZernioKey !== null && loadSettings().zernioApiKey !== previousZernioKey) resetZernioState(getMainWindow)
+    return saved
+  })
+
+  // "Test connection" in Settings. Both use the saved settings; no key or provider reply reaches the renderer.
+  handle('settings:testAiProvider', (_event, provider: unknown) => testAiProvider(provider, loadSettings()))
+  const checkWhisper = (): ReturnType<typeof checkLocalWhisper> => {
+    const settings = loadSettings()
+    return checkLocalWhisper(settings, {
+      python: resolvePythonPath(getEnginePath(), settings.pythonPath),
+      enginePath: getEnginePath(),
+      env: runtimeEnvironment(),
+      packaged: app.isPackaged
+    })
+  }
+  handle('settings:checkLocalWhisper', checkWhisper)
+
+  // Local Whisper model manager. The page names a model; main alone builds paths, from the
+  // same cache locations the engine downloads to (runtimeEnvironment passes them through).
+  handle('whisper:listModels', () => listWhisperModels({ env: runtimeEnvironment(), checkEngine: checkWhisper, packaged: app.isPackaged }))
+  const engineBusy = (): boolean => hasActiveJobs() || liveJobIds().size > 0 || anyEditorOperation()
+  handle('whisper:deleteModel', (_event, request: unknown) => deleteWhisperModel(request, {
+    env: runtimeEnvironment(),
+    // A download in progress may be writing the very files a delete would remove.
+    isBusy: () => engineBusy() || whisperSetupRunning()
+  }))
+  // One-click setup: download a model, or install and test the GPU libraries. Progress goes to the
+  // window that asked; only fixed messages and byte counts cross over.
+  const setupDeps = (): SetupDeps => {
+    const settings = loadSettings()
+    return {
+      python: resolvePythonPath(getEnginePath(), settings.pythonPath), enginePath: getEnginePath(), env: runtimeEnvironment(),
+      isBusy: engineBusy, packaged: app.isPackaged
+    }
+  }
+  const sendSetupProgress = (event: Electron.IpcMainInvokeEvent) => (progress: WhisperSetupProgress): void => {
+    if (!event.sender.isDestroyed()) event.sender.send('whisper:setupProgress', progress)
+  }
+  handle('whisper:downloadModel', (event, name: unknown) => downloadWhisperModel(name, setupDeps(), sendSetupProgress(event)))
+  handle('whisper:enableGpu', (event, name: unknown) => enableWhisperGpu(name, setupDeps(), sendSetupProgress(event)))
+  handle('whisper:cancelSetup', () => cancelWhisperSetup())
+  handle('whisper:setupState', () => whisperSetupState())
+
+  // Social accounts via the user's own Zernio key (main process only).
+  handle('zernio:overview', () => getZernioOverview())
+  handle('zernio:profiles:create', (_event, name: unknown) => createZernioProfile(name))
+  handle('zernio:sync', () => syncZernioAccounts())
+  handle('zernio:checkStatus', () => checkZernioStatus())
+  handle('zernio:cachedOverview', () => readCachedOverview())
+  handle('zernio:pendingConnect', () => getPendingZernioConnect())
+  handle('zernio:connect', (_event, platform: unknown, profileId: unknown, options: unknown) => connectZernioAccount(platform, profileId, options, getMainWindow))
+  handle('zernio:cancelConnect', () => cancelZernioConnect())
+  handle('zernio:disconnect', (_event, accountId: unknown) => disconnectZernioAccount(accountId))
+
+  // Posting clips through Zernio. Uploads and post links stay in the main process.
+  handle('zernio:posts:probe', (_event, clipPath: unknown, durationMs: unknown) => probeClipForPosting(clipPath, durationMs))
+  handle('zernio:posts:tiktokCreatorInfo', (_event, accountId: unknown) => getTikTokCreatorInfo(accountId))
+  handle('zernio:posts:publish', (event, request: unknown) => publishClip(request, (progress) => {
+    if (!event.sender.isDestroyed()) event.sender.send('zernio:postProgress', progress)
+  }))
+  handle('zernio:posts:cancelUpload', (_event, attemptId: unknown) => cancelUpload(attemptId))
+  handle('zernio:posts:list', () => listPosts())
+  handle('zernio:posts:refresh', (_event, force: unknown) => refreshPosts(force))
+  handle('zernio:posts:cancel', (_event, postId: unknown) => cancelPost(postId))
+  handle('zernio:posts:reschedule', (_event, postId: unknown, scheduledFor: unknown, timezone: unknown) => reschedulePost(postId, scheduledFor, timezone))
+  handle('zernio:posts:retry', (_event, postId: unknown) => retryPost(postId))
+  handle('zernio:posts:dismiss', (_event, postId: unknown) => dismissPost(postId))
+  handle('zernio:posts:open', (_event, postId: unknown, targetIndex: unknown) => openPostLink(postId, targetIndex))
+  handle('zernio:posts:openTikTokLegal', (_event, key: unknown) => openTikTokLegal(key))
+
+  handle('automations:enhancementGroups', (_event, id: unknown) => automationEnhancementGroups(id))
+  handle('automations:enhanceBatch', (_event, id: unknown, ids: unknown, key: unknown, guidance: unknown) => enhanceAutomationBatch(id, ids, key, guidance))
+  handle('automations:source', (_event, id: unknown, contentId: unknown) => automationContentSource(id, contentId))
+  handle('automations:enhance', (_event, id: unknown, contentId: unknown, options: unknown) => enhanceAutomationContent(id, contentId, options))
+  handle('automations:resolveDraft', (_event, id: unknown, contentId: unknown, draftId: unknown, apply: unknown) => resolveAutomationMetadataDraft(id, contentId, draftId, apply))
+  handle('automations:list', () => listAutomations())
+  handle('automations:acknowledgeWarnings', (_event, id: unknown, contentId: unknown) => acknowledgeAutomationWarnings(id, contentId))
+  handle('automations:dismissMetadataError', (_event, id: unknown, contentId: unknown) => dismissAutomationMetadataError(id, contentId))
+  handle('automations:reviewContent', (_event, id: unknown, contentId: unknown, returnToQueue: unknown) => reviewAutomationContent(id, contentId, returnToQueue))
+  handle('automations:libraryClip', (_event, id: unknown, contentId: unknown) => automationLibraryClip(id, contentId))
+  handle('automations:showInFolder', (_event, id: unknown, contentId: unknown) => showAutomationContentInFolder(id, contentId))
+  handle('automations:reorder', (_event, id: unknown, contentId: unknown, beforeId: unknown) => reorderAutomationContent(id, contentId, beforeId))
+  handle('automations:create', (_event, name: unknown) => createAutomation(name))
+  handle('automations:update', (_event, id: unknown, update: unknown) => updateAutomation(id, update))
+  handle('automations:delete', (_event, id: unknown) => deleteAutomation(id))
+  handle('automations:retryContent', (_event, id: unknown, contentId: unknown) => retryAutomationContent(id, contentId))
+  handle('automations:run', (_event, id: unknown) => runAutomation(id))
+  handle('automations:addLibraryClips', (_event, id: unknown, outputDir: unknown, clipIndices: unknown) => addLibraryClipsToAutomation(id, outputDir, clipIndices))
+  handle('automations:updateContent', (_event, id: unknown, contentId: unknown, update: unknown) => updateAutomationContent(id, contentId, update))
+  handle('automations:prepareTikTokReview', (_event, id: unknown, contentId: unknown) => prepareAutomationTikTokReview(id, contentId))
+  handle('automations:approveTikTokReview', (_event, id: unknown, contentId: unknown, update: unknown) => approveAutomationTikTokReview(id, contentId, update))
+  handle('automations:removeContent', (_event, id: unknown, contentId: unknown) => removeAutomationContent(id, contentId))
+  handle('automations:addContent', async (_event, id: unknown) => {
+    const window = getMainWindow()
+    if (!window) return listAutomations()
+    const result = await dialog.showOpenDialog(window, {
+      properties: ['openFile', 'multiSelections'],
+      title: 'Add clips to automation',
+      filters: [{ name: 'Postable videos', extensions: ['mp4', 'mov', 'm4v', 'webm'] }]
+    })
+    if (result.canceled) return listAutomations()
+    for (const path of result.filePaths) authorizeMedia(path)
+    return addAutomationContent(id, result.filePaths)
+  })
+
+  handle('settings:selectOutputDir', async () => {
+    const window = getMainWindow()
+    if (!window) return null
+
+    const result = await dialog.showOpenDialog(window, {
+      properties: ['openDirectory', 'createDirectory'],
+      title: 'Choose Output Folder'
+    })
+
+    if (result.canceled || result.filePaths.length === 0) return null
+    selectedOutputDirectories.add(result.filePaths[0])
+    return result.filePaths[0]
+  })
+
+  handle('job:start', (_event, config: unknown) => startClipJobRequest(config))
+
+  handle('job:cancel', (_event, jobId: unknown) => {
+    if (typeof jobId !== 'string') return false
+    logger.info('job.cancel.request', { jobId })
+    return cancelTrackedJob(jobId)
+  })
+
+  handle('jobs:list', () => listJobs())
+  handle('jobs:dismiss', (_event, jobId: unknown) => typeof jobId === 'string' && dismissJob(jobId))
+
+  handle('diagnostics:getLogPath', () => {
+    return getLogFilePath()
+  })
+
+  handle('diagnostics:openLogFolder', () => {
+    const logFile = getLogFilePath()
+    if (existsSync(logFile)) {
+      shell.showItemInFolder(logFile)
+      return true
+    }
+    return false
+  })
+
+  handle('history:list', () => {
+    const settings = loadSettings()
+    return getJobHistory(settings.outputDirectory, liveJobIds())
+  })
+
+  handle('history:postingStatus', (_event, outputDir: unknown) => libraryPostingStatus(outputDir))
+  handle('history:postingSummary', (_event, outputDirs: unknown) => libraryPostingSummary(outputDirs))
+  handle('history:setPosted', (_event, outputDir: unknown, clipIndex: unknown, posted: unknown) => setLibraryPosted(outputDir, clipIndex, posted))
+  handle('history:setFavorite', (_event, outputDir: unknown, favorite: unknown) => setLibraryFavorite(outputDir, favorite))
+  handle('history:delete', (_event, outputDir: unknown) => deleteLibraryRun(outputDir))
+  handle('history:deleteClips', (_event, outputDir: unknown, indices: unknown) => deleteLibraryClips(outputDir, indices))
+  handle('history:metadataSource', (_event, outputDir: unknown, clipIndex: unknown) => libraryMetadataSource(outputDir, clipIndex))
+  handle('history:enhanceMetadata', (_event, outputDir: unknown, clipIndex: unknown, options: unknown) => enhanceLibraryMetadata(outputDir, clipIndex, options))
+  handle('history:getJob', (_event, outputDir: string) => {
+    assertAbsolutePath(outputDir)
+    if (!isWithinDirectory(outputDir, loadSettings().outputDirectory)) throw new Error('Job is outside the library')
+    return getJobOutput(outputDir, loadSettings().outputDirectory)
+  })
+
+  handle('editor:open', (_event, path: unknown) => openEditor(path))
+  handle('editor:save', (_event, path: unknown, revision: unknown, edits: unknown) => saveEditor(path, revision, edits))
+  handle('editor:run', (_event, path: unknown, revision: unknown, id: unknown, action: unknown) => runEditor(path, revision, id, action))
+  handle('editor:cancel', (_event, path: unknown) => cancelEditor(path))
+  handle('editor:replaceSource', (_event, path: unknown, revision: unknown, replacement: unknown) => replaceEditorSource(path, revision, replacement))
+  handle('editor:progress', (_event, path: unknown) => readEditorProgress(path))
+  handle('editor:freeMedia', (_event, path: unknown, revision: unknown) => freeEditorMedia(path, revision))
+  handle('editor:closeReady', (_event, saved: unknown) => editorCloseReady(saved))
+
+  handle('edits:inspect', (_event, outputDir: string) => inspectEdits(outputDir, loadSettings().outputDirectory))
+
+  handle('thumbnails:generate', async (_event, videoPath: string, seekSeconds?: number) => {
+    if (isAutomationMedia(videoPath)) authorizeMedia(videoPath)
+    else assertMediaPath(videoPath, loadSettings().outputDirectory)
+    if (seekSeconds !== undefined && (!Number.isFinite(seekSeconds) || seekSeconds < 0 || seekSeconds > 6 * 60 * 60)) throw new Error('Invalid thumbnail time')
+    const thumbnail = await generateThumbnail(videoPath, seekSeconds)
+    if (thumbnail) authorizeMedia(thumbnail)
+    return thumbnail
+  })
+
+  handle('shell:openPath', async (_event, path: unknown) => {
+    if (isWebUrl(path)) {
+      if (!isTrustedExternalUrl(path)) throw new Error('This external link is not supported')
+      await shell.openExternal(path)
+      return true
+    }
+    assertAbsolutePath(path)
+    if (!existsSync(path)) return false
+    // Check and open the same canonical name: an alias can hide a .app suffix.
+    const canonical = realpathSync(path)
+    if (!isWithinDirectory(canonical, loadSettings().outputDirectory)) assertMediaPath(canonical, loadSettings().outputDirectory)
+    const { statSync } = await import('fs')
+    if (statSync(canonical).isDirectory()) {
+      // macOS opens these directory packages with Installer, System Settings,
+      // Automator or the bundle itself instead of showing a folder.
+      if (canonical.split(/[\\/]+/).some((part) => /\.(app|bundle|pkg|mpkg|prefpane|saver|workflow|action|xpc|appex|plugin|kext|framework|qlgenerator|wdgt)$/i.test(part))) throw new Error('Application bundles cannot be opened from the library')
+    } else {
+      assertMediaPath(canonical, loadSettings().outputDirectory)
+    }
+    return (await shell.openPath(canonical)) === ''
+  })
+
+  handle('shell:showItemInFolder', (_event, path: string) => {
+    assertAbsolutePath(path)
+    if (!isWithinDirectory(path, loadSettings().outputDirectory)) assertMediaPath(path, loadSettings().outputDirectory)
+    if (!existsSync(path)) return false
+    shell.showItemInFolder(path)
+    return true
+  })
+
+  handle('dialog:selectVideo', async () => {
+    const window = getMainWindow()
+    if (!window) return null
+
+    const result = await dialog.showOpenDialog(window, {
+      properties: ['openFile'],
+      title: 'Choose a Video',
+      filters: [
+        { name: 'Video Files', extensions: ['mp4', 'm4v', 'mkv', 'webm', 'avi', 'mov', 'flv'] },
+        { name: 'All Files', extensions: ['*'] }
+      ]
+    })
+
+    if (result.canceled || result.filePaths.length === 0) return null
+    return authorizeMedia(result.filePaths[0])
+  })
+
+  handle('clips:bulkExport', async (_event, clips: { path: string; name: string }[]) => {
+    const window = getMainWindow()
+    if (!Array.isArray(clips) || clips.length > 500) throw new Error('Invalid export selection')
+    for (const clip of clips) {
+      if (!clip || typeof clip.name !== 'string' || clip.name.length > 500) throw new Error('Invalid export selection')
+      assertMediaPath(clip.path, loadSettings().outputDirectory)
+    }
+    if (!window || clips.length === 0) return { success: false, count: 0, failedCount: clips.length }
+
+    const result = await dialog.showOpenDialog(window, {
+      properties: ['openDirectory', 'createDirectory'],
+      title: 'Export Clips To…'
+    })
+    if (result.canceled || result.filePaths.length === 0) return { success: false, count: 0, failedCount: 0 }
+
+    const destDir = result.filePaths[0]
+    const { open, rm } = await import('fs/promises')
+    const { pipeline } = await import('stream/promises')
+    const { extname, join } = await import('path')
+    let count = 0
+
+    for (const clip of clips) {
+      try {
+        const source = await openAuthorizedMedia(clip.path, loadSettings().outputDirectory)
+        try {
+          const ext = extname(clip.path) || '.mp4'
+          const safeName = Array.from(clip.name).filter((char) => char.charCodeAt(0) >= 32).join('').replace(/[<>:"/\\|?*]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 120) || 'clip'
+          let suffix = 0
+          while (true) {
+            const dest = join(destDir, `${safeName}${suffix ? ` (${suffix})` : ''}${ext}`)
+            let target: Awaited<ReturnType<typeof open>> | undefined
+            try {
+              target = await open(dest, 'wx', 0o600)
+              await pipeline(source.handle.createReadStream({ autoClose: false }), target.createWriteStream({ autoClose: false }))
+              await target.close()
+              break
+            } catch (error) {
+              await target?.close()
+              if (target) await rm(dest, { force: true })
+              if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || ++suffix > 10000) throw error
+            }
+          }
+          count++
+        } finally {
+          await source.handle.close()
+        }
+      } catch { /* Counted below as an unsuccessful copy. */ }
+    }
+
+    return { success: count > 0, count, failedCount: clips.length - count, destDir }
+  })
+
+  handle('system:isPackaged', () => {
+    return app.isPackaged
+  })
+
+  handle('system:checkTools', async () => {
+    const { execFile } = await import('child_process')
+    const { promisify } = await import('util')
+    const execFileAsync = promisify(execFile)
+    const { join } = await import('path')
+    const settings = loadSettings()
+    const enginePath = getEnginePath()
+    const bridgePath = getBridgeRunnerPath()
+    const resolvedPython = resolvePythonPath(enginePath, settings.pythonPath)
+
+    // ffmpeg/ffprobe only accept `-version`; `--version` exits non-zero and
+    // made the check report them missing even when installed.
+    const check = async (cmd: string, flag = '--version'): Promise<boolean> => {
+      try {
+        await execFileAsync(cmd, [flag], { timeout: 5000 })
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    const [pythonValidation, python, ffmpeg, ffmpegCaptions, ffprobe, ytdlp] = await Promise.all([
+      validatePython(resolvedPython, enginePath),
+      check(resolvedPython),
+      check(resolveBinary('ffmpeg'), '-version'),
+      supportsCaptionFilter(),
+      check(resolveBinary('ffprobe'), '-version'),
+      check(resolveBinary('yt-dlp'))
+    ])
+
+    const result = {
+      python,
+      pythonDeps: pythonValidation.ok,
+      pythonPath: resolvedPython,
+      pythonError: pythonValidation.error,
+      pythonHint: pythonValidation.hint,
+      pythonRepairCommand: pythonValidation.repairCommand,
+      ffmpeg,
+      ffmpegCaptions,
+      ffprobe,
+      ytdlp,
+      engine: existsSync(join(enginePath, 'clip_engine', 'bridge_contract.py')),
+      enginePath,
+      bridgeRunner: existsSync(bridgePath),
+      bridgePath
+    }
+    logger.info('system.checkTools', result)
+    return result
+  })
+}
