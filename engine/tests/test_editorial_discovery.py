@@ -1,0 +1,272 @@
+"""Offline regressions for narrative anchors, alternatives and bounded rediscovery."""
+import asyncio
+import json
+from types import SimpleNamespace
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+
+from clip_engine.services.editorial_evidence import parse_moment, discovery_feedback
+from clip_engine.services.intelligence_planner import ClipPlanSegment, ClipPlanResponse, PlanningApiCosts
+from tests.test_planner import make_planner, make_transcript, clip, completion
+
+
+def moment():
+    return {'topic': 'One example', 'topic_start_segment': 0, 'topic_end_segment': 7,
+            'setup_segment': 1, 'payoff_segment': 5, 'requires_visual_context': False}
+
+
+def test_candidate_construction_includes_setup_and_payoff_before_review():
+    planner = make_planner()
+    planner._jev_enabled = True
+    planner._current_transcript = make_transcript(40).segments
+    planner._current_video_duration = 40
+    result = planner._parse_clip_plan_response(completion(json.dumps({'clips': [{**clip(10, 19.5), 'moment': moment()}]})))
+    assert len(result.segments) == 1
+    candidate = result.segments[0]
+    assert (candidate.start_time_ms, candidate.end_time_ms) == (5000, 29500)
+    assert candidate.moment['setup']['speaker'] == 'S2'
+
+
+def test_jev_anchor_mismatch_is_logged_and_audited_not_silent(caplog):
+    planner = make_planner()
+    planner._jev_enabled = True
+    planner.audit = {'requests': []}
+    planner._current_transcript = make_transcript(60).segments
+    planner._current_video_duration = 60
+    clips = [{**clip(10, 19.5), 'moment': {**moment(), 'setup_segment': 99}},
+             {**clip(45, 54.5), 'moment': moment()}]            # runs past its own topic
+    with caplog.at_level('WARNING'):
+        result = planner._parse_clip_plan_response(completion(json.dumps({'clips': clips})))
+    assert result.segments == []
+    reasons = [d['reason'] for d in planner.audit['discarded']]
+    assert reasons[0].startswith('moment anchors') and reasons[1] == 'excerpt extends outside its moment topic'
+    assert caplog.text.count('Discarding planner candidate') == 2
+
+
+def test_invalid_narrative_anchors_are_rejected():
+    segments = make_transcript(40).segments
+    for changed in [{'setup_segment': -1}, {'payoff_segment': 99}, {'setup_segment': True}, {'setup_segment': 6, 'payoff_segment': 1}]:
+        with pytest.raises(ValueError):
+            parse_moment({**moment(), **changed}, segments)
+
+
+def test_discovery_keeps_alternatives_but_collapses_identical_boundaries():
+    planner = make_planner()
+    clips = [ClipPlanSegment(0, 30000, .9), ClipPlanSegment(10000, 40000, .8), ClipPlanSegment(0, 30000, .7)]
+    assert len(planner._finalize_clips(clips, 8, allow_alternatives=True)) == 2
+
+
+def test_boundary_alternatives_do_not_take_clip_slots():
+    planner = make_planner()
+    clips = [ClipPlanSegment(0, 30000, .9), ClipPlanSegment(10000, 40000, .8), ClipPlanSegment(5000, 35000, .75),
+             ClipPlanSegment(60000, 90000, .7), ClipPlanSegment(120000, 150000, .6)]
+    kept = planner._finalize_clips(clips, 2, allow_alternatives=True)
+    # Two distinct moments fill the two slots; one alternative per moment rides along.
+    assert [(c.start_time_ms, c.end_time_ms) for c in kept] == [(0, 30000), (10000, 40000), (60000, 90000)]
+    # Without Jev the overlap drops and the next distinct moment is used.
+    kept = planner._finalize_clips(clips, 2)
+    assert [(c.start_time_ms, c.end_time_ms) for c in kept] == [(0, 30000), (60000, 90000)]
+
+
+def test_second_pass_targets_at_most_six_unproposed_spans():
+    entries = [{'original_interval': [i * 60000, i * 60000 + 10000], 'title': str(i), 'status': 'rejected'} for i in range(12)]
+    feedback = discovery_feedback(entries, 720000)
+    assert len(feedback['search_intervals']) == 6
+    assert all(b - a >= 30000 for a, b in feedback['search_intervals'])
+
+
+@pytest.mark.parametrize('search_fails', [False, True])
+def test_pipeline_rediscovery_is_bounded_and_preserves_approved_clips(monkeypatch, tmp_path, search_fails):
+    from clip_engine.services import ai_clipping_pipeline as module
+    from clip_engine.services.ai_clipping_pipeline import AIClippingPipeline, ClippingJobRequest, JobStatus
+    from clip_engine.services.rendering_service import RenderingService, RenderResult
+    from clip_engine.services.transcription_service import TranscriptionResult, TranscriptSegment
+    from tests.test_coherence_review import reviewer
+    settings = module.get_settings()
+    monkeypatch.setattr(settings, 'local_mode', True)
+    monkeypatch.setattr(settings, 'jev_enabled', True)  # Rediscovery only follows Jev review.
+    monkeypatch.setattr(settings, 'openrouter_api_key', 'fixture')
+    monkeypatch.setattr(settings, 'local_output_dir', str(tmp_path / 'out'))
+    monkeypatch.setattr(settings.__class__, 'temp_directory', property(lambda self: str(tmp_path / 'work')))
+    monkeypatch.setattr(RenderingService, '_verify_ffmpeg', lambda self: None)
+    pipeline = AIClippingPipeline()
+    gate, _ = reviewer(lambda state, q: 'Rejected' not in state['retained_dialogue'])
+    gate.segments = [TranscriptSegment(0, 11000, 'Approved original.'), TranscriptSegment(40000, 51000, 'Rejected excerpt.'), TranscriptSegment(100000, 111000, 'Approved overlooked idea.')]
+    gate.duration_ms = 360000
+    gate.repair = AsyncMock(return_value=None)
+    monkeypatch.setattr(module, 'CoherenceReviewer', lambda *args: gate)
+    monkeypatch.setattr(module, 'protect_acknowledgments', AsyncMock())
+    monkeypatch.setattr(module, 'review_duplicate_candidates', AsyncMock())
+    download = AsyncMock(return_value=SimpleNamespace(video_path=str(tmp_path / 'source.mp4'), file_size_bytes=1,
+        metadata=SimpleNamespace(title='Synthetic source', duration_seconds=360, width=1920, height=1080)))
+    transcribe = AsyncMock(return_value=TranscriptionResult(segments=gate.segments, full_text='Full source'))
+    calls = []
+    async def plan(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 2:
+            assert kwargs['max_clips'] == 1 and kwargs['auto_clip_count'] is False
+            assert len(kwargs['discovery_feedback']['previous_candidates']) == 2
+            if search_fails:
+                raise RuntimeError('Fixture outage')
+            segments = [ClipPlanSegment(100000, 111000, .9), ClipPlanSegment(0, 11000, .8)]
+        else:
+            segments = [ClipPlanSegment(0, 11000, .9), ClipPlanSegment(40000, 51000, .8)]
+        return ClipPlanResponse(segments=segments, total_clips=2, api_costs=PlanningApiCosts(provider='fixture', model='fixture', estimated_cost_usd=.01, attempts=1))
+    async def render(request):
+        Path(request.output_path).write_bytes(b'fixture')
+        return RenderResult(output_path=request.output_path, file_size_bytes=7, duration_ms=11000)
+    monkeypatch.setattr(pipeline.video_downloader, 'download_video', download)
+    monkeypatch.setattr(pipeline.transcription_service, 'transcribe', transcribe)
+    monkeypatch.setattr(pipeline.intelligence_planner, 'plan_clips', plan)
+    monkeypatch.setattr(pipeline.rendering_service, 'render_clip', AsyncMock(side_effect=render))
+    result = asyncio.run(pipeline.process_video(ClippingJobRequest(video_url='fixture.mp4', job_id='fixture', max_clips=2, auto_clip_count=False)))
+    assert result.status == JobStatus.COMPLETED, result.error
+    audit = json.loads((tmp_path / 'out/fixture/edit_audit.json').read_text())
+    assert len(calls) == 2 and transcribe.await_count == 1 and download.await_count == 1
+    assert len(audit['candidates']) == (2 if search_fails else 3)
+    assert audit['discovery']['status'] == ('unavailable' if search_fails else 'completed')
+    assert sum(c['status'] == 'rendered' for c in audit['candidates']) == (1 if search_fails else 2)
+    if not search_fails:
+        assert audit['candidates'][-1]['discovery_pass'] == 2
+        output = json.loads((tmp_path / 'out/fixture/job_output.json').read_text())
+        assert output['metrics']['api_costs']['planning']['estimated_cost_usd'] == .02
+
+
+def test_failed_second_discovery_has_no_transport_retry(monkeypatch):
+    from clip_engine.services.intelligence_planner import IntelligencePlanningError
+    planner = make_planner()
+    planner.audit = {'requests': []}
+    call = AsyncMock(side_effect=IntelligencePlanningError('Fixture outage', retryable=True))
+    monkeypatch.setattr(planner, '_call_openrouter', call)
+    with pytest.raises(IntelligencePlanningError):
+        asyncio.run(planner.plan_clips(make_transcript(120), jev_enabled=True,
+                                       discovery_feedback={'search_intervals': [[0, 120000]], 'previous_candidates': []}))
+    assert call.await_count == 1
+    assert planner.audit['requests'][0]['discovery_pass'] == 2
+
+
+def test_discovery_excludes_repaired_approved_footage():
+    feedback = discovery_feedback([{'original_interval': [50000, 60000], 'title': 'Moment', 'status': 'accepted',
+        'report': {'coherence': {'accepted_interval': [0, 90000]}}}], 150000)
+    assert feedback['search_intervals'] == [[90000, 150000]]
+    assert feedback['previous_candidates'][0]['interval'] == [0, 90000]
+
+
+@pytest.mark.parametrize('mode', ['off', 'unavailable', 'on'])
+def test_automatic_jev_opt_out_skips_review_but_enabled_failures_do_not(monkeypatch, tmp_path, mode):
+    from clip_engine.services import ai_clipping_pipeline as module
+    from clip_engine.services.ai_clipping_pipeline import AIClippingPipeline, ClippingJobRequest, JobStatus
+    from clip_engine.services.rendering_service import RenderingService, RenderResult
+    from clip_engine.services.transcription_service import TranscriptionResult, TranscriptSegment
+    from clip_engine.services.coherence_review import CoherenceReviewer
+    from clip_engine.services.jev_service import JevService
+    from tests.test_editorial_context import response
+    settings = module.get_settings()
+    monkeypatch.setattr(settings, 'local_mode', True)
+    monkeypatch.setattr(settings, 'jev_enabled', mode != 'off')
+    monkeypatch.setattr(settings, 'jev_visual_context', True)
+    monkeypatch.setattr(settings, 'openrouter_api_key', 'fixture')
+    monkeypatch.setattr(settings, 'local_output_dir', str(tmp_path / 'out'))
+    monkeypatch.setattr(settings.__class__, 'temp_directory', property(lambda self: str(tmp_path / 'work')))
+    monkeypatch.setattr(RenderingService, '_verify_ffmpeg', lambda self: None)
+    # No live model requests. Detect every attempted Jev call with an active key.
+    live_calls = []
+    async def evaluate(self, state, questions):
+        if not self.enabled:
+            return {'status': 'disabled', 'questions': questions, 'answers': {}}
+        live_calls.append(questions)
+        if mode == 'unavailable':
+            return {'status': 'unavailable', 'questions': questions, 'answers': {}}
+        return {'status': 'success', 'questions': questions, 'answers': response(questions)['answers']}
+    monkeypatch.setattr(JevService, 'evaluate', evaluate)
+    repair = AsyncMock(side_effect=AssertionError('Unexpected repair request'))
+    monkeypatch.setattr(CoherenceReviewer, 'repair', repair)
+    observed = []
+    monkeypatch.setattr(module.EditorialVision, 'observe', AsyncMock(side_effect=AssertionError('Unexpected editorial vision request')))
+    pipeline = AIClippingPipeline()
+    source = SimpleNamespace(video_path=str(tmp_path / 'source.mp4'), file_size_bytes=1,
+        metadata=SimpleNamespace(title='Synthetic source', duration_seconds=360, width=1920, height=1080))
+    monkeypatch.setattr(pipeline.video_downloader, 'download_video', AsyncMock(return_value=source))
+    transcript = TranscriptionResult(segments=[TranscriptSegment(0, 20000, 'A complete first idea.'),
+        TranscriptSegment(40000, 60000, 'A complete second idea.'), TranscriptSegment(80000, 100000, 'A third idea.')], full_text='Source')
+    monkeypatch.setattr(pipeline.transcription_service, 'transcribe', AsyncMock(return_value=transcript))
+    monkeypatch.setattr(pipeline.source_context_service, 'build', AsyncMock(return_value={
+        'status': 'metadata_only', 'source': {}, 'brief': None, 'research_status': 'not_applicable',
+        'citations': [], 'cost_usd': 0, 'cost_incomplete': False, 'requests': []}))
+    plan = AsyncMock(return_value=ClipPlanResponse(segments=[
+        ClipPlanSegment(0, 11000, .9, skip_ranges_ms=[(4000, 5000)]),
+        ClipPlanSegment(2000, 13000, .8),  # Overlapping alternative must still be excluded.
+        ClipPlanSegment(40000, 51000, .7),
+        ClipPlanSegment(80000, 91000, .6)], total_clips=4))
+    monkeypatch.setattr(pipeline.intelligence_planner, 'plan_clips', plan)
+    async def render(request):
+        observed.append(request)
+        if mode == 'off':
+            assert request.coherence_reviewer is None
+            assert request.editorial_service is None
+            assert request.editorial_context['coherence']['status'] == 'skipped'
+        else:
+            assert request.coherence_reviewer is not None
+            assert request.editorial_service.enabled
+        Path(request.output_path).write_bytes(b'fixture')
+        return RenderResult(output_path=request.output_path, file_size_bytes=7, duration_ms=11000)
+    monkeypatch.setattr(pipeline.rendering_service, 'render_clip', AsyncMock(side_effect=render))
+    result = asyncio.run(pipeline.process_video(ClippingJobRequest(video_url='fixture.mp4', job_id='fixture', max_clips=2, auto_clip_count=False)))
+    audit = json.loads((tmp_path / 'out/fixture/edit_audit.json').read_text())
+    assert audit['jev_enabled'] is (mode != 'off')
+    assert plan.await_count == 1  # No rediscovery when disabled, unavailable, or already full.
+    repair.assert_not_awaited()
+    if mode == 'unavailable':
+        assert result.status == JobStatus.FAILED
+        assert not observed
+        assert live_calls
+        assert audit['outcome'] == 'no_approved_clips'
+        return
+    assert result.status == JobStatus.COMPLETED, result.error
+    assert len(observed) == 2
+    assert [request.start_time_ms for request in observed] == [0, 40000]
+    assert observed[0].skip_ranges_ms == [(4000, 5000)]
+    assert [c['status'] for c in audit['candidates']] == ['rendered', 'overlap_not_selected', 'rendered', 'selection_limit']
+    if mode == 'off':
+        assert not live_calls
+        assert 'discovery' not in audit
+        for c in audit['candidates'][:3]:
+            assert c['report']['coherence']['status'] == 'skipped'
+            assert c['report']['coherence']['reason'] == 'disabled_by_user'
+            assert c['report']['coherence']['attempts'] == []
+        output = json.loads((tmp_path / 'out/fixture/job_output.json').read_text())
+        assert not {'editorial', 'editorial_repair', 'editorial_vision'} & output['metrics']['api_costs'].keys()
+        assert next(row for row in output['metrics']['pipeline_stages'] if row['id'] == 'reviewing')['state'] == 'skipped'
+    else:
+        assert live_calls
+        assert audit['candidates'][0]['report']['coherence']['status'] == 'accepted'
+
+
+def test_second_pass_searches_only_inside_the_preferred_range():
+    entries = [{'original_interval': [i * 60000, i * 60000 + 10000], 'title': str(i), 'status': 'rejected'} for i in range(12)]
+    unbounded = discovery_feedback(entries, 720000)
+    assert discovery_feedback(entries, 720000, [None, None]) == unbounded
+    feedback = discovery_feedback(entries, 720000, [125, 360])
+    assert feedback['search_intervals'] == [[130000, 180000], [190000, 240000], [250000, 300000], [310000, 360000]]
+    assert all(125000 <= a < b <= 360000 for a, b in feedback['search_intervals'])
+    assert len(feedback['previous_candidates']) == 12  # Exclusions still list every earlier proposal.
+    # Candidates outside the range do not hide it; a too-short remainder yields no search.
+    assert discovery_feedback(entries[:2], 720000, [300, 420])['search_intervals'] == [[300000, 420000]]
+    assert discovery_feedback(entries, 720000, [60, 80])['search_intervals'] == []
+    # An open-ended or out-of-bounds range is clamped to the source.
+    assert discovery_feedback([], 720000, [None, 9999])['search_intervals'] == [[0, 720000]]
+    assert discovery_feedback([], 720000, [700, None])['search_intervals'] == []
+
+
+def test_pipeline_second_pass_receives_the_saved_preferred_range(monkeypatch, tmp_path):
+    from clip_engine.services import ai_clipping_pipeline as module
+    seen = []
+    real = module.discovery_feedback
+    def spy(entries, duration_ms, preferred_range=None):
+        seen.append(preferred_range)
+        return real(entries, duration_ms, preferred_range)
+    monkeypatch.setattr(module, 'discovery_feedback', spy)
+    test_pipeline_rediscovery_is_bounded_and_preserves_approved_clips(monkeypatch, tmp_path, False)
+    assert seen == [[None, None]]

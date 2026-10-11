@@ -1,0 +1,32 @@
+# FastAPI and server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+pydantic>=2.5.3
+pydantic-settings>=2.1.0
+
+# AWS
+boto3>=1.34.0
+
+# Smart layout analysis: face detection (YuNet, assets/models) + shot cuts
+# <5: OpenCV 5's new DNN engine runs YuNet ~5x slower and asserts under
+# concurrent detectors.
+opencv-python-headless>=4.10,<5
+numpy>=1.26
+Pillow>=10.0
+
+# yt-dlp for video download. YouTube breaks old releases (2026.03.17 gets
+# HTTP 403 on video data), so keep this floor current. [default] pulls in
+# yt-dlp-ejs for YouTube's JS challenges.
+yt-dlp[default]>=2026.8.19
+PySocks
+
+# Utilities
+httpx>=0.26.0
+python-json-logger>=2.0.7
+aiofiles>=23.0.0
+
+# Built-in local transcription (Settings → AI & transcription → Local Whisper).
+# The app downloads models on demand; NVIDIA's GPU libraries are an optional
+# one-click install, so they are not listed here.
+faster-whisper>=1.2.1,<2

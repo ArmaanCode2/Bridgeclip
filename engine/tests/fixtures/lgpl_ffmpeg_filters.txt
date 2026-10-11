@@ -1,0 +1,48 @@
+# Filters available in the shipped LGPL FFmpeg 8.1.3 (engine-bin) that
+# BridgeClip's graphs use or may reasonably use. test_ffmpeg_filters.py checks
+# every emitted filter against this list without needing FFmpeg, and checks
+# this list against `engine-bin/ffmpeg -hide_banner -filters` when staged.
+# Add a name only after confirming it in that output. GPL-only filters
+# (perspective, boxblur, eq, ...) and drawtext (no libfreetype build) are absent.
+aeval
+afade
+aformat
+amix
+anull
+anullsrc
+apad
+aresample
+asetpts
+asettb
+asplit
+ass
+atempo
+atrim
+avgblur
+concat
+crop
+drawbox
+fade
+format
+fps
+gblur
+hstack
+loudnorm
+lutyuv
+metadata
+null
+overlay
+pad
+scale
+select
+setdar
+setpts
+setsar
+settb
+split
+subtitles
+tpad
+trim
+volume
+vstack
+zoompan
