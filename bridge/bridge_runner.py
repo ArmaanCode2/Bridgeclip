@@ -56,6 +56,9 @@ FAILURES = (
     (("local whisper transcription failed",),
      "Local Whisper transcription failed.",
      "Try a smaller model. Running out of memory is the most common cause with large models."),
+    (("saved transcript could not be reused",),
+     "The transcript from the earlier run could not be used.",
+     "It is missing, damaged, or covers a different part of the video. Use Run again to transcribe the video again."),
     (("ai provider rejected the api key",),
      "Your AI provider rejected the API key.",
      "Check the key in Settings → AI & transcription and use Test connection."),
@@ -200,8 +203,12 @@ FAILURES = (
 )
 
 
-def missing_configuration(settings) -> list[str]:
-    """Names of the settings the chosen providers need but do not have."""
+def missing_configuration(settings, transcribes: bool = True) -> list[str]:
+    """Names of the settings the chosen providers need but do not have.
+
+    A run that continues from a saved transcript does not transcribe, so it
+    needs nothing for transcription.
+    """
     provider = getattr(settings, "ai_provider", "openrouter")
     missing: list[str] = []
     if provider == "gemini":
@@ -214,6 +221,8 @@ def missing_configuration(settings) -> list[str]:
             missing.append("OPENAI_COMPATIBLE_MODEL")
     elif not settings.openrouter_api_key:
         missing.append("OPENROUTER_API_KEY")
+    if not transcribes:
+        return missing
     if getattr(settings, "transcription_source", "cloud") == "local":
         if getattr(settings, "local_whisper_mode", "builtin") == "server" and not getattr(settings, "local_whisper_url", None):
             missing.append("LOCAL_WHISPER_URL")
@@ -318,7 +327,7 @@ async def run(config: dict) -> bool:
 
     settings = get_settings()
 
-    missing = missing_configuration(settings)
+    missing = missing_configuration(settings, transcribes=not config.get("resume_transcript"))
     if missing:
         prefix = "API keys" if all(m.endswith("_KEY") for m in missing) else "configuration"
         emit({"type": "error", "message": f"Missing required {prefix}: {', '.join(missing)}"})
@@ -363,6 +372,7 @@ async def run(config: dict) -> bool:
         banner_channel_url=config.get("banner_channel_url"),
         keyterms=config.get("keyterms") or None,
         clip_request=config.get("clip_request"),
+        resume_transcript_path=config.get("resume_transcript"),
     )
 
     emit({
@@ -447,11 +457,17 @@ def validate_config(config: object) -> dict:
         raise ValueError("Video speed must be between 1x and 2x")
     if config.get("clipping_mode", "quality") not in ("quality", "economy", "advanced"):
         raise ValueError("Invalid clipping mode")
-    local_transcription = os.environ.get("TRANSCRIPTION_SOURCE") == "local"
+    resume = config.get("resume_transcript")
+    if resume is not None and (
+        not isinstance(resume, str) or len(resume) > 4096 or "\0" in resume
+        or not os.path.isabs(resume) or os.path.basename(resume) != "transcript.json"
+    ):
+        raise ValueError("Invalid saved transcript")
+    # Local Whisper, or a saved transcript, means no cloud transcription model is used.
+    local_transcription = os.environ.get("TRANSCRIPTION_SOURCE") == "local" or resume is not None
     for field in ("planner_model", "transcription_model"):
         if config.get("clipping_mode") == "advanced":
             value = config.get(field)
-            # Local Whisper does not use a cloud transcription model.
             if field == "transcription_model" and local_transcription and value is None:
                 continue
             if not isinstance(value, str) or len(value) > 120 or not re.fullmatch(r"~?[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:-]*", value):
@@ -493,7 +509,9 @@ def main() -> int:
     try:
         # Legacy CLI argument remains accepted; Electron uses stdin to keep
         # private source URLs out of process listings. Bound either transport.
-        raw = sys.argv[1] if len(sys.argv) == 2 else sys.stdin.read(65537)
+        # Electron writes UTF-8. Text-mode stdin would decode it with the Windows ANSI code
+        # page (cp1252 on most systems), garbling non-ASCII file names and clip requests.
+        raw = sys.argv[1] if len(sys.argv) == 2 else sys.stdin.buffer.read(4 * 65536 + 4).decode("utf-8")
         if len(raw) > 65536:
             raise ValueError("Config too large")
         config = validate_config(json.loads(raw))

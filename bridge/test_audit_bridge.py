@@ -103,7 +103,8 @@ class ProtocolAuditTests(unittest.TestCase):
         for raw in ['{"contract_version": 2, "job_id": "%s"}' % secret, "[" * 60000, '{"a": ' + secret]:
             with self.subTest(raw=raw[:40]):
                 output = io.StringIO()
-                with patch.object(sys, "argv", ["bridge_runner.py"]), patch.object(sys, "stdin", io.StringIO(raw)), \
+                piped = io.TextIOWrapper(io.BytesIO(raw.encode("utf-8")), encoding="utf-8")
+                with patch.object(sys, "argv", ["bridge_runner.py"]), patch.object(sys, "stdin", piped), \
                         patch.dict(os.environ, {"OPENROUTER_API_KEY": secret}), redirect_stdout(output):
                     try:
                         code = bridge.main()

@@ -60,6 +60,7 @@ from clip_engine.services.transcription_service import (
     NoAudioTrackError,
     TranscriptionResult,
     TranscriptionService,
+    load_saved_transcript,
 )
 from clip_engine.services.visual_clip_sampling import has_visual_change, sample_visual_planning_frames
 from clip_engine.services.video_downloader import (
@@ -124,6 +125,8 @@ class ClippingJobRequest:
     video_speed: float = 1.0
     workflow: str = 'automatic'
     caption_preset: str = 'pop'
+    # transcript.json from an earlier run of the same video; when set, it replaces transcription.
+    resume_transcript_path: Optional[str] = None
 
     def __post_init__(self):
         validate_video_speed(self.video_speed)
@@ -309,9 +312,11 @@ class AIClippingPipeline:
             # Step 2: Transcribe audio. Jev reviews setup and payoff anywhere in
             # the source, so it needs all of it; otherwise only the chosen range.
             current_stage = "transcription"
+            transcript_range = (None, None) if jev_enabled else (request.start_time_seconds, effective_end_time)
             self._update_progress(
                 job_id, JobStatus.TRANSCRIBING, 15,
-                "Transcribing the full source for context..." if jev_enabled else "Transcribing audio...",
+                "Using the transcript saved by the earlier run..." if request.resume_transcript_path
+                else "Transcribing the full source for context..." if jev_enabled else "Transcribing audio...",
             )
             stage_start = time.perf_counter()
             previous_transcription_progress = getattr(self.transcription_service, "progress_callback", None)
@@ -322,13 +327,18 @@ class AIClippingPipeline:
                 job_id, JobStatus.TRANSCRIBING, 15 + 10 * done / total, f'Transcribing audio, part {done + 1} of {total}…',
                 stage_id='transcription', stage_percent=100 * done / total, completed=done, total=total, unit='chunks')
             try:
-                transcription_result = await self.transcription_service.transcribe(
-                    video_path=download_result.video_path,
-                    work_dir=work_dir,
-                    keyterms=transcription_terms(request.keyterms, source_context) if source_context else request.keyterms,
-                    start_seconds=None if jev_enabled else request.start_time_seconds,
-                    end_seconds=None if jev_enabled else effective_end_time,
-                )
+                if request.resume_transcript_path:
+                    # An earlier run of this video already transcribed it; only the later steps run again.
+                    transcription_result, transcription_status, transcript_range = await asyncio.to_thread(
+                        load_saved_transcript, request.resume_transcript_path, transcript_range, video_duration)
+                else:
+                    transcription_result = await self.transcription_service.transcribe(
+                        video_path=download_result.video_path,
+                        work_dir=work_dir,
+                        keyterms=transcription_terms(request.keyterms, source_context) if source_context else request.keyterms,
+                        start_seconds=transcript_range[0],
+                        end_seconds=transcript_range[1],
+                    )
             except NoAudioTrackError:
                 logger.info("Source has no audio track; trying visual-only planning")
                 transcription_result = TranscriptionResult(segments=[], full_text="", provider="no_audio")
@@ -362,6 +372,10 @@ class AIClippingPipeline:
                 "language": transcription_result.language,
                 "status": transcription_status,
                 "captions_available": bool(transcription_result.segments),
+                # The part of the source that was transcribed (None: an open end) and the source's
+                # length, so a later run can tell whether this transcript fits its video and range.
+                "source_range": list(transcript_range),
+                "source_duration_seconds": video_duration,
             }
 
             if self.local_mode:
@@ -972,8 +986,10 @@ class AIClippingPipeline:
                 "requested_settings": {
                     "clipping_mode": self.settings.clipping_mode,
                     "planner_model": self.settings.planner_model,
+                    # A continued run transcribed nothing; Advanced mode then has no transcription model.
                     "transcription_model": (
-                        self.settings.local_whisper_model if self.settings.transcription_source == "local"
+                        "saved transcript" if request.resume_transcript_path
+                        else self.settings.local_whisper_model if self.settings.transcription_source == "local"
                         else self.settings.transcription_model),
                     "aspect_ratio": request.aspect_ratio,
                     "layout_style": request.layout_style,

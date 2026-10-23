@@ -68,6 +68,21 @@ test('a Gemini user with cloud transcription is told why OpenRouter is needed an
   assert.deepEqual(local, { ok: true, clippingMode: 'quality', layoutVision: undefined })
 })
 
+test('a run continuing from a saved transcript needs nothing for transcription, but still needs its planner', () => {
+  const gemini = settings({ aiProvider: 'gemini', openrouterApiKey: '', transcriptionSource: 'cloud' })
+  assert.equal(gateJobStart(gemini, { workflow: 'automatic' }).ok, false)
+  assert.deepEqual(gateJobStart(gemini, { workflow: 'automatic' }, { transcribes: false }), { ok: true, clippingMode: 'quality', layoutVision: undefined })
+  const server = settings({ transcriptionSource: 'local', localWhisperMode: 'server', localWhisperUrl: '' })
+  assert.equal(gateJobStart(server, { workflow: 'automatic' }).ok, false)
+  assert.equal(gateJobStart(server, { workflow: 'automatic' }, { transcribes: false }).ok, true)
+  const noPlanner = gateJobStart(settings({ aiProvider: 'gemini', geminiApiKey: '' }), { workflow: 'automatic' }, { transcribes: false })
+  assert.equal(noPlanner.ok, false)
+  assert.equal(noPlanner.missing, 'gemini-key')
+  const noOpenRouter = gateJobStart(settings({ openrouterApiKey: '' }), { workflow: 'automatic' }, { transcribes: false })
+  assert.equal(noOpenRouter.ok, false)
+  assert.equal(noOpenRouter.missing, 'openrouter-key')
+})
+
 test('Review & edit runs on every provider; Advanced explains that it needs OpenRouter', () => {
   for (const aiProvider of ['gemini', 'openai-compatible']) {
     assert.equal(gateJobStart(settings({ aiProvider }), { workflow: 'review' }).ok, true, aiProvider)

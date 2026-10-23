@@ -1,5 +1,6 @@
 import { parseRunDiagnostics } from '../shared/run-diagnostics'
 import { parseStages } from '../shared/job-progress'
+import { lstatSync } from 'fs'
 import { join } from 'path'
 import { cancelJob as cancelRunningJob, startClipJob, type ClipJobConfig, type JobEventSink } from './pipeline-runner'
 import { finishRunRecord } from './run-history'
@@ -17,7 +18,10 @@ import { isActiveJobStatus, MAX_FINISHED_JOBS, MAX_PARALLEL_JOBS, type JobSnapsh
 
 interface TrackedJob {
   snapshot: JobSnapshot
+  /** What the run starts with, after main's checks adjusted it for the Settings of that moment. */
   config: ClipJobConfig
+  /** The options as submitted, so Run again and Continue re-check them against today's Settings. */
+  request: ClipJobConfig
   outputDirectory: string
 }
 
@@ -53,14 +57,30 @@ function update(jobId: string, patch: Partial<Omit<JobSnapshot, 'id' | 'revision
   broadcast(job.snapshot)
 }
 
+function regularFile(path: string): string | null {
+  try { return lstatSync(path).isFile() ? path : null } catch { return null }
+}
+
+/**
+ * The transcript a stopped run can continue from: the one it saved in its folder, or, for a
+ * continued run that stopped before saving its own copy, the one it was given. Links do not count.
+ */
+function savedTranscript(job: TrackedJob): string | null {
+  return regularFile(join(job.snapshot.outputDir, 'transcript.json'))
+    ?? (job.config.resumeTranscript ? regularFile(job.config.resumeTranscript) : null)
+}
+
 function finish(jobId: string, status: Extract<JobStatus, 'completed' | 'failed' | 'cancelled'>, patch: Partial<JobSnapshot> = {}): void {
-  const previous = jobs.get(jobId)?.snapshot
+  const job = jobs.get(jobId)
+  const previous = job?.snapshot
   const now = Date.now()
   const stages = previous?.stages?.map(stage => stage.state !== 'running' ? stage : {
     ...stage, state: status, percent: status === 'completed' ? 100 : stage.percent,
     elapsed_ms: stage.elapsed_ms + Math.max(0, now - (previous.progressAt ?? now))
   })
-  update(jobId, { ...patch, ...(stages ? { stages, progressAt: now } : {}), status, finishedAt: new Date(now).toISOString() })
+  // A run stopped after transcription can continue from its transcript.
+  const transcriptSaved = status !== 'completed' && job !== undefined && savedTranscript(job) !== null
+  update(jobId, { ...patch, ...(stages ? { stages, progressAt: now } : {}), ...(transcriptSaved ? { transcriptSaved } : {}), status, finishedAt: new Date(now).toISOString() })
   pruneFinished()
 }
 
@@ -69,12 +89,15 @@ function pruneFinished(): void {
   for (const job of finished.slice(0, Math.max(0, finished.length - MAX_FINISHED_JOBS))) jobs.delete(job.snapshot.id)
 }
 
-/** Track a new job (its run record already exists) and start it as soon as a slot is free. */
-export function enqueueJob(jobId: string, config: ClipJobConfig, outputDirectory: string): JobSnapshot {
+/**
+ * Track a new job (its run record already exists) and start it as soon as a slot is free.
+ * `request` is the job's options as submitted, when main adjusted them into `config`.
+ */
+export function enqueueJob(jobId: string, config: ClipJobConfig, outputDirectory: string, request: ClipJobConfig = config): JobSnapshot {
   const snapshot: JobSnapshot = {
     id: jobId,
     revision: 0,
-    request: config,
+    request,
     status: 'queued',
     percent: 0,
     step: 'Waiting for a free slot',
@@ -91,7 +114,7 @@ export function enqueueJob(jobId: string, config: ClipJobConfig, outputDirectory
     startedAt: null,
     finishedAt: null
   }
-  jobs.set(jobId, { snapshot, config, outputDirectory })
+  jobs.set(jobId, { snapshot, config, request, outputDirectory })
   queue.push(jobId)
   broadcast(snapshot)
   pump()
@@ -122,6 +145,11 @@ function pump(): void {
 
 function onExit(jobId: string): void {
   if (!running.delete(jobId)) return
+  // A run cancelled just as transcription finished saves its transcript while stopping.
+  const job = jobs.get(jobId)
+  if (job && (job.snapshot.status === 'failed' || job.snapshot.status === 'cancelled') && !job.snapshot.transcriptSaved && savedTranscript(job)) {
+    update(jobId, { transcriptSaved: true })
+  }
   pump()
 }
 
@@ -191,6 +219,14 @@ export function dismissJob(jobId: string): boolean {
 
 export function getJob(jobId: string): JobSnapshot | null {
   return jobs.get(jobId)?.snapshot ?? null
+}
+
+/** A failed or cancelled job's options and the transcript it saved, or null when it has none to continue from. */
+export function resumableJob(jobId: string): { request: ClipJobConfig; transcript: string } | null {
+  const job = jobs.get(jobId)
+  if (!job || (job.snapshot.status !== 'failed' && job.snapshot.status !== 'cancelled')) return null
+  const transcript = savedTranscript(job)
+  return transcript ? { request: job.request, transcript } : null
 }
 
 export function listJobs(): JobSnapshot[] {

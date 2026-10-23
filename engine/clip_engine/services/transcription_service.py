@@ -10,6 +10,7 @@ import tempfile
 import logging
 import os
 import random
+import stat
 import subprocess
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -927,3 +928,118 @@ def _provider_failure(status: int, retry_after: str | None = None) -> Transcript
     else:
         reason = "rejected"
     return TranscriptionProviderError(reason, status, _retry_after_seconds(retry_after))
+
+
+# A saved transcript is read back from the output folder, so it is bounded and checked
+# like any other untrusted file before the planner sees it.
+MAX_SAVED_TRANSCRIPT_BYTES = 64 * 1024 * 1024
+MAX_SAVED_SEGMENTS = 200_000
+MAX_SAVED_WORDS_PER_SEGMENT = 20_000
+MAX_SAVED_TEXT_CHARS = 100_000
+# Range ends are stored as given; allow for float noise when comparing them.
+RANGE_TOLERANCE_SECONDS = 0.01
+# A re-exported or re-uploaded video at the same path or link usually changes length.
+SOURCE_DURATION_TOLERANCE_SECONDS = 1.0
+
+
+class SavedTranscriptError(TranscriptionError):
+    """The transcript an earlier run saved cannot be used for this run."""
+
+    def __init__(self, message: str):
+        super().__init__(message, reason="saved_transcript_unusable")
+
+
+def _saved_ms(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise SavedTranscriptError("Saved transcript has an invalid time")
+    return value
+
+
+def _saved_text(value: object, limit: int = MAX_SAVED_TEXT_CHARS) -> str:
+    if not isinstance(value, str) or len(value) > limit:
+        raise SavedTranscriptError("Saved transcript has invalid text")
+    return value
+
+
+def _saved_segment(raw: object) -> TranscriptSegment:
+    if not isinstance(raw, dict):
+        raise SavedTranscriptError("Saved transcript has an invalid segment")
+    start, end = _saved_ms(raw.get("start_time_ms")), _saved_ms(raw.get("end_time_ms"))
+    words = raw.get("words", [])
+    events = raw.get("audio_events", [])
+    speaker = raw.get("speaker_label")
+    if end < start or not isinstance(words, list) or len(words) > MAX_SAVED_WORDS_PER_SEGMENT \
+            or not isinstance(events, list) or len(events) > 100 \
+            or (speaker is not None and (not isinstance(speaker, str) or len(speaker) > 64)):
+        raise SavedTranscriptError("Saved transcript has an invalid segment")
+    parsed_words = []
+    for word in words:
+        if not isinstance(word, dict):
+            raise SavedTranscriptError("Saved transcript has an invalid word")
+        word_start, word_end = _saved_ms(word.get("start_time_ms")), _saved_ms(word.get("end_time_ms"))
+        if word_end < word_start:
+            raise SavedTranscriptError("Saved transcript has an invalid word")
+        parsed_words.append(TranscriptWord(_saved_text(word.get("word"), 1000), word_start, word_end))
+    return TranscriptSegment(start, end, _saved_text(raw.get("text")), speaker,
+                             parsed_words, [_saved_text(event, 200) for event in events])
+
+
+def _covers(saved: object, wanted: tuple[Optional[float], Optional[float]], duration_seconds: float) -> bool:
+    """Whether a saved source range includes the range this run needs. None is an open end."""
+    if not isinstance(saved, list) or len(saved) != 2 \
+            or any(value is not None and not _nonnegative_number(value) for value in saved):
+        return False
+    saved_start, saved_end = (saved[0] or 0.0), saved[1]
+    wanted_start, wanted_end = (wanted[0] or 0.0), wanted[1]
+    if saved_start > wanted_start + RANGE_TOLERANCE_SECONDS:
+        return False
+    if saved_end is None:
+        return True
+    return saved_end + RANGE_TOLERANCE_SECONDS >= (duration_seconds if wanted_end is None else wanted_end)
+
+
+def load_saved_transcript(path: str, wanted_range: tuple[Optional[float], Optional[float]],
+                          duration_seconds: float) -> tuple[TranscriptionResult, str, tuple[Optional[float], Optional[float]]]:
+    """Read the transcript.json an earlier run of the same video saved.
+
+    Returns the transcript, its status for ``wanted_range`` ("available", or
+    "no_speech" when nothing was said there) and the range it covers. It must be
+    for a video of ``duration_seconds`` and cover ``wanted_range`` (source
+    seconds, None for an open end), the part this run would otherwise transcribe.
+    """
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise SavedTranscriptError("Saved transcript is not a regular file")
+        if info.st_size > MAX_SAVED_TRANSCRIPT_BYTES:
+            raise SavedTranscriptError("Saved transcript is too large")
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.loads(handle.read(MAX_SAVED_TRANSCRIPT_BYTES + 1))
+    except SavedTranscriptError:
+        raise
+    except (OSError, ValueError, RecursionError):
+        raise SavedTranscriptError("Saved transcript could not be read") from None
+    if not isinstance(data, dict) or not isinstance(data.get("segments"), list) \
+            or len(data["segments"]) > MAX_SAVED_SEGMENTS or data.get("status") not in ("available", "no_speech"):
+        raise SavedTranscriptError("Saved transcript is not in the expected format")
+    saved_duration = data.get("source_duration_seconds")
+    if not _nonnegative_number(saved_duration) \
+            or abs(saved_duration - duration_seconds) > SOURCE_DURATION_TOLERANCE_SECONDS:
+        raise SavedTranscriptError("Saved transcript is for a different version of the video")
+    if not _covers(data.get("source_range"), wanted_range, duration_seconds):
+        raise SavedTranscriptError("Saved transcript covers a different part of the video")
+    segments = [_saved_segment(raw) for raw in data["segments"]]
+    language = data.get("language")
+    if language is not None and (not isinstance(language, str) or len(language) > 32):
+        raise SavedTranscriptError("Saved transcript has an invalid language")
+    full_text = data.get("full_text", "")
+    result = TranscriptionResult(
+        segments=segments, full_text=_saved_text(full_text, MAX_SAVED_TRANSCRIPT_BYTES), language=language,
+        provider="saved", model="saved",
+    )
+    # A full transcript reused for a quiet part of the video plans from frames, as a fresh run would.
+    start_ms = round((wanted_range[0] or 0) * 1000)
+    end_ms = math.inf if wanted_range[1] is None else round(wanted_range[1] * 1000)
+    spoken = any(s.end_time_ms > start_ms and s.start_time_ms < end_ms for s in segments)
+    status = "available" if spoken and data["status"] == "available" else "no_speech"
+    return result, status, (data["source_range"][0], data["source_range"][1])

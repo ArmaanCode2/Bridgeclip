@@ -52,8 +52,10 @@ export function setupInputFromSettings(settings: JobGateSettings): ProviderSetup
  *   saved model, and without the frame analysis the person asked to skip.
  * - A custom OpenAI-compatible model reads video frames only if the person said it can.
  */
-export function gateJobStart(settings: JobGateSettings, request: JobGateRequest): JobGateResult {
-  const gap = setupGaps(setupInputFromSettings(settings))[0]
+export function gateJobStart(settings: JobGateSettings, request: JobGateRequest, options: { transcribes?: boolean } = {}): JobGateResult {
+  // A run that continues from a saved transcript needs nothing for transcription.
+  const input = setupInputFromSettings(settings)
+  const gap = setupGaps(options.transcribes === false ? { ...input, transcriptionSource: 'local', localWhisperMode: 'builtin' } : input)[0]
   if (gap) {
     const error = gap.id === 'openrouter-key' && settings.aiProvider === 'openrouter'
       ? 'OpenRouter API key is required for AI clip planning. Go to Settings to add it.'

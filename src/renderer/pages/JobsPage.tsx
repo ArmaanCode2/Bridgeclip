@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Ban, FileText, FolderOpen, ListVideo, Pencil, Plus, RefreshCw, RotateCcw, Search, X } from 'lucide-react'
+import { Ban, FileText, FolderOpen, ListVideo, Pencil, Plus, RefreshCw, Search, X } from 'lucide-react'
 import type { HistoryEntry } from '../../preload/index'
 import { MAX_PARALLEL_JOBS } from '../../shared/jobs'
 import { EditInspector, InspectEditsButton } from '../components/EditInspector'
 import { BackLink } from '../components/ClipList'
-import { JobFailure, JobProgress, STAGE_LABELS } from '../components/JobProgress'
+import { JobFailure, JobProgress, RetryActions, STAGE_LABELS } from '../components/JobProgress'
 import type { Page as AppPage } from '../components/Sidebar'
 import { StatusDot } from '../components/ui/Badge'
 import { Button } from '../components/ui/Button'
@@ -60,6 +60,9 @@ export function JobsPage({ onNavigate, onViewLibrary }: {
   const [error, setError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [jobsLoaded, setJobsLoaded] = useState(false)
+  const [starting, setStarting] = useState(false)
+  // A double click lands before the state update renders; the ref stops the second start.
+  const startingRef = useRef(false)
   const requestId = useRef(0)
 
   const load = useCallback(async (manual = false) => {
@@ -119,10 +122,13 @@ export function JobsPage({ onNavigate, onViewLibrary }: {
     }
   }
 
-  const runAgain = async (job: Job): Promise<void> => {
+  const runAgain = async (job: Job, fromTranscript = false): Promise<void> => {
+    if (startingRef.current) return
+    startingRef.current = true
+    setStarting(true)
     setError(null)
     try {
-      const result = await getApi().job.start(job.request)
+      const result = fromTranscript ? await getApi().job.resume(job.id) : await getApi().job.start(job.request)
       if (result.error) setError(result.error)
       else if (result.jobId) {
         if (result.job) useJobStore.getState().upsert(result.job)
@@ -131,6 +137,9 @@ export function JobsPage({ onNavigate, onViewLibrary }: {
       }
     } catch (err) {
       setError(errorMessage(err, 'Could not start this job again.'))
+    } finally {
+      startingRef.current = false
+      setStarting(false)
     }
   }
 
@@ -155,9 +164,11 @@ export function JobsPage({ onNavigate, onViewLibrary }: {
     }
     if (focused.status === 'completed') return <></>
     if (focused.status === 'failed') {
-      return <>{errorCallout}<div className="px-6 pt-3"><InspectEditsButton outputDir={focused.outputDir} /></div><JobFailure job={focused} leading={back} onRetry={() => { void runAgain(focused) }} /></>
+      return <>{errorCallout}<div className="px-6 pt-3"><InspectEditsButton outputDir={focused.outputDir} /></div><JobFailure job={focused} leading={back}
+        onRetry={() => { void runAgain(focused) }} onContinue={() => { void runAgain(focused, true) }} busy={starting} /></>
     }
-    return <>{errorCallout}<JobCancelled job={focused} leading={back} onRetry={() => { void runAgain(focused) }} /></>
+    return <>{errorCallout}<JobCancelled job={focused} leading={back} busy={starting}
+      onRetry={() => { void runAgain(focused) }} onContinue={() => { void runAgain(focused, true) }} /></>
   }
 
   return (
@@ -493,14 +504,23 @@ function PreviousJobRow({ entry, hasDetails, onOpen, onOpenFolder }: { entry: Hi
   )
 }
 
-function JobCancelled({ job, leading, onRetry }: { job: Job; leading: React.ReactNode; onRetry: () => void }): React.JSX.Element {
+function JobCancelled({ job, leading, onRetry, onContinue, busy }: {
+  job: Job
+  leading: React.ReactNode
+  onRetry: () => void
+  onContinue: () => void
+  busy: boolean
+}): React.JSX.Element {
   return (
     <Page width="focus">
       <div className="mb-3">{leading}</div>
       <h1 className="text-xl font-semibold tracking-[-0.02em] text-ink">Job cancelled</h1>
       <p className="mt-1 truncate text-sm text-ink-muted" title={job.request.videoUrl}>{sourceLabel(job.request.videoUrl)}</p>
-      <div className="mt-4">
-        <Button variant="primary" icon={<RotateCcw className="h-3.5 w-3.5" />} onClick={onRetry}>Run again</Button>
+      {job.transcriptSaved && <p className="mt-3 text-sm leading-relaxed text-ink-muted">
+        The transcript from this run is saved. Change the AI provider, endpoint, key or model in Settings if you need to, then continue without transcribing again.
+      </p>}
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <RetryActions job={job} onRetry={onRetry} onContinue={onContinue} busy={busy} iconClass="h-3.5 w-3.5" />
       </div>
     </Page>
   )

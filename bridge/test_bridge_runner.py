@@ -14,6 +14,11 @@ from unittest.mock import patch
 import bridge_runner as bridge
 
 
+def stdin(text, encoding="utf-8"):
+    """A piped stdin: UTF-8 bytes underneath, decoded with ``encoding`` in text mode."""
+    return io.TextIOWrapper(io.BytesIO(text.encode("utf-8")), encoding=encoding)
+
+
 class BridgeTests(unittest.TestCase):
     def config(self, **overrides):
         return {"contract_version": 3, "layout_vision_enabled": True, "job_id": "job-123", "video_url": "https://example.com/video", **overrides}
@@ -184,10 +189,28 @@ class BridgeTests(unittest.TestCase):
     def test_stdin_transport_and_size_limit(self):
         async def success(config):
             return True
-        with patch.object(sys, "argv", ["bridge_runner.py"]), patch.object(sys, "stdin", io.StringIO(json.dumps(self.config()))), patch.object(bridge, "run", success):
+        with patch.object(sys, "argv", ["bridge_runner.py"]), patch.object(sys, "stdin", stdin(json.dumps(self.config()))), patch.object(bridge, "run", success):
             self.assertEqual(bridge.main(), 0)
-        with patch.object(sys, "argv", ["bridge_runner.py"]), patch.object(sys, "stdin", io.StringIO(" " * 65537)), redirect_stdout(io.StringIO()):
-            self.assertEqual(bridge.main(), 1)
+        for raw in (" " * 65537, "\U0001F7E5" * 65537):
+            with patch.object(sys, "argv", ["bridge_runner.py"]), patch.object(sys, "stdin", stdin(raw)), redirect_stdout(io.StringIO()):
+                self.assertEqual(bridge.main(), 1)
+
+    def test_stdin_is_read_as_utf8_whatever_the_console_code_page(self):
+        # Windows gives a piped stdin the ANSI code page (cp1252); Electron writes UTF-8.
+        with tempfile.TemporaryDirectory() as folder:
+            video = os.path.join(folder, "stream \U0001F7E5 café क्लिप.mp4")
+            open(video, "wb").close()
+            received = []
+
+            async def success(config):
+                received.append(config)
+                return True
+            raw = json.dumps(self.config(video_url=video, clip_request="the café bit \U0001F600"), ensure_ascii=False)
+            with patch.object(sys, "argv", ["bridge_runner.py"]), patch.object(sys, "stdin", stdin(raw, "cp1252")), \
+                    patch.object(bridge, "run", success):
+                self.assertEqual(bridge.main(), 0)
+        self.assertEqual(received[0]["video_url"], video)
+        self.assertEqual(received[0]["clip_request"], "the café bit \U0001F600")
 
     def test_provider_errors_do_not_disclose_exception_text(self):
         output = io.StringIO()
@@ -385,6 +408,79 @@ class ProviderConfigurationTests(unittest.TestCase):
         self.assertEqual(bridge.describe_failure("Transcription authentication failed")["message"],
                          "OpenRouter rejected the transcription request.")
         self.assertEqual(bridge.describe_failure("Transcription failed")["message"], "Audio transcription failed.")
+
+    def test_a_run_from_a_saved_transcript_needs_nothing_for_transcription(self):
+        cases = [
+            # Gemini planning no longer needs OpenRouter when nothing is transcribed.
+            (dict(ai_provider="gemini", gemini_api_key="g"), []),
+            (dict(ai_provider="gemini", gemini_api_key="g", transcription_source="local",
+                  local_whisper_mode="server"), []),
+            # The planner's own settings are still required.
+            (dict(), ["OPENROUTER_API_KEY"]),
+            (dict(ai_provider="openai-compatible"), ["OPENAI_COMPATIBLE_URL", "OPENAI_COMPATIBLE_MODEL"]),
+        ]
+        for values, expected in cases:
+            with self.subTest(values=values):
+                self.assertEqual(bridge.missing_configuration(self.settings(**values), transcribes=False), expected)
+
+    def test_an_unusable_saved_transcript_has_its_own_message(self):
+        # Must match SAVED_TRANSCRIPT_ERROR in engine/clip_engine/error_policy.py.
+        failure = bridge.describe_failure("Saved transcript could not be reused")
+        self.assertEqual(failure["message"], "The transcript from the earlier run could not be used.")
+        self.assertIn("Run again", failure["hint"])
+
+
+class ResumeTranscriptConfigTests(unittest.TestCase):
+    def config(self, **overrides):
+        return {"contract_version": 3, "layout_vision_enabled": True, "job_id": "job-123",
+                "video_url": "https://example.com/video", **overrides}
+
+    def test_only_an_absolute_transcript_json_path_is_accepted(self):
+        path = os.path.abspath(os.path.join("clips", "earlier-run", "transcript.json"))
+        self.assertEqual(bridge.validate_config(self.config(resume_transcript=path))["resume_transcript"], path)
+        for value in ("transcript.json", os.path.join("relative", "transcript.json"),
+                      os.path.abspath("edit_audit.json"), path + "\0", 3, "", os.path.abspath("x" * 4100 + "/transcript.json")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                bridge.validate_config(self.config(resume_transcript=value))
+
+    def test_advanced_mode_needs_no_cloud_transcription_model_when_continuing(self):
+        path = os.path.abspath(os.path.join("clips", "earlier-run", "transcript.json"))
+        config = self.config(clipping_mode="advanced", planner_model="vendor/planner", resume_transcript=path)
+        with patch.dict(os.environ, {"TRANSCRIPTION_SOURCE": "cloud"}):
+            self.assertEqual(bridge.validate_config(config)["planner_model"], "vendor/planner")
+            with self.assertRaises(ValueError):
+                bridge.validate_config({**config, "planner_model": ""})
+
+    def test_the_saved_transcript_reaches_the_pipeline_without_an_openrouter_key(self):
+        from dataclasses import make_dataclass
+        Output = make_dataclass("Output", [("clips", list)])
+        requests = []
+
+        class Pipeline:
+            def __init__(self, **kwargs): pass
+
+            async def process_video(self, request):
+                requests.append(request)
+                return types.SimpleNamespace(status="completed", output=Output([]), job_id="job-123")
+        settings = types.SimpleNamespace(ai_provider="gemini", gemini_api_key="g", openrouter_api_key="",
+                                         transcription_source="cloud")
+        modules = {
+            "clip_engine.config": types.SimpleNamespace(get_settings=lambda: settings, get_caption_preset=lambda name: None),
+            "clip_engine.bridge_contract": types.SimpleNamespace(BRIDGE_CONTRACT_VERSION=3),
+            "clip_engine.logging_safety": types.SimpleNamespace(install_safe_logging=lambda: None),
+            "clip_engine.services.ai_clipping_pipeline": types.SimpleNamespace(
+                AIClippingPipeline=Pipeline, ClippingJobRequest=lambda **kwargs: kwargs,
+                JobStatus=types.SimpleNamespace(COMPLETED="completed")),
+        }
+        path = os.path.abspath(os.path.join("clips", "earlier-run", "transcript.json"))
+        with patch.dict(sys.modules, modules), redirect_stdout(io.StringIO()) as output:
+            self.assertTrue(asyncio.run(bridge.run(self.config(resume_transcript=path))))
+        self.assertIn('"type": "result"', output.getvalue())
+        self.assertEqual(requests[-1]["resume_transcript_path"], path)
+        # Without a saved transcript, cloud transcription still needs the OpenRouter key.
+        with patch.dict(sys.modules, modules), redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(asyncio.run(bridge.run(self.config())))
+        self.assertIn("OPENROUTER_API_KEY", output.getvalue())
 
 
 if __name__ == '__main__':

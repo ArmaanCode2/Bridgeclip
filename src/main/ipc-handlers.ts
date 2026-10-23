@@ -12,7 +12,7 @@ import { deleteWhisperModel, listWhisperModels } from './whisper-models'
 import { cancelWhisperSetup, downloadWhisperModel, enableWhisperGpu, whisperSetupRunning, whisperSetupState, type SetupDeps } from './whisper-setup'
 import type { WhisperSetupProgress } from '../shared/whisper-models'
 import { cancelTrackedJob, dismissJob, initJobManager, listJobs, liveJobIds } from './job-manager'
-import { startClipJobRequest } from './job-start'
+import { resumeClipJobRequest, startClipJobRequest } from './job-start'
 import { logger, getLogFilePath } from './logger'
 import { assertAbsolutePath, assertMediaPath, assertTrustedSender, authorizeMedia, isTrustedExternalUrl, isWebUrl, isWithinDirectory, openAuthorizedMedia } from './security'
 import { getModelCatalog } from './openrouter-models'
@@ -197,6 +197,7 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
   })
 
   handle('job:start', (_event, config: unknown) => startClipJobRequest(config))
+  handle('job:resume', (_event, jobId: unknown) => resumeClipJobRequest(jobId))
 
   handle('job:cancel', (_event, jobId: unknown) => {
     if (typeof jobId !== 'string') return false

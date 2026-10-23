@@ -5,7 +5,7 @@ import { ensureOutputDir } from './file-manager'
 import { getBridgeRunnerPath, getEnginePath, preflightCheck, resolvePythonPath, runtimeEnvironment, validatePython, type ClipJobConfig } from './pipeline-runner'
 import { checkLocalWhisper } from './provider-checks'
 import { createRunRecord, finishRunRecord } from './run-history'
-import { enqueueJob } from './job-manager'
+import { enqueueJob, resumableJob } from './job-manager'
 import { logger } from './logger'
 import { assertMediaPath, isWebUrl } from './security'
 import { assertPublicWebUrl } from './network-policy'
@@ -27,15 +27,29 @@ export type StartJobResult = { jobId: string; queued: boolean; job: JobSnapshot 
  * folder and queue it. Used by the Create page and the assistant alike; it
  * needs no window, so jobs can start while every window is closed.
  */
-export async function startClipJobRequest(request: unknown): Promise<StartJobResult> {
+export async function startClipJobRequest(request: unknown, options: { resumeTranscript?: string } = {}): Promise<StartJobResult> {
   let config: ClipJobConfig
   const settings = loadSettings()
+  // Continuing from a saved transcript skips transcription, so nothing it needs is checked.
+  const transcribes = !options.resumeTranscript
   try {
-    config = validateJobConfig(request, { transcriptionOptional: settings.transcriptionSource === 'local' })
+    config = validateJobConfig(request, { transcriptionOptional: !transcribes || settings.transcriptionSource === 'local' })
   } catch (error) { return { error: error instanceof Error ? error.message : 'Invalid job options' } }
+  // Kept as submitted: Run again and Continue check it against the Settings of their own moment.
+  const submitted: ClipJobConfig = { ...config }
+  if (options.resumeTranscript) {
+    config.resumeTranscript = options.resumeTranscript
+    // Advanced picks OpenRouter models. Continuing after a switch to Gemini or a custom endpoint
+    // plans with that provider's saved model, as Quality does.
+    if (config.clippingMode === 'advanced' && settings.aiProvider !== 'openrouter') {
+      config.clippingMode = 'quality'
+      delete config.plannerModel
+      delete config.transcriptionModel
+    }
+  }
 
   // Before anything reaches OpenRouter's catalog: is the chosen provider ready, and can it run this job?
-  const gate = gateJobStart(settings, config)
+  const gate = gateJobStart(settings, config, { transcribes })
   if (!gate.ok) {
     logger.warn('job.start.blocked', { reason: gate.missing })
     return { error: gate.error }
@@ -45,8 +59,8 @@ export async function startClipJobRequest(request: unknown): Promise<StartJobRes
 
   try {
     if (config.clippingMode === 'advanced') {
-      // Local Whisper transcribes, so any cloud transcription model is ignored rather than validated.
-      if (settings.transcriptionSource === 'local') delete config.transcriptionModel
+      // Local Whisper or a saved transcript: any cloud transcription model is ignored rather than validated.
+      if (settings.transcriptionSource === 'local' || !transcribes) delete config.transcriptionModel
       config.plannerCapabilities = await resolveAdvancedModels(config.plannerModel!, config.transcriptionModel)
     }
     if (isWebUrl(config.videoUrl)) await assertPublicWebUrl(config.videoUrl)
@@ -84,9 +98,9 @@ export async function startClipJobRequest(request: unknown): Promise<StartJobRes
   if (config.includeCaptions && !(await supportsCaptionFilter())) {
     return { error: 'FFmpeg cannot render captions because its ass filter is missing. Install an FFmpeg build with libass, or turn captions off.' }
   }
-  const setupBlocked = whisperSetupBlock(whisperSetupState()?.task ?? null)
+  const setupBlocked = transcribes ? whisperSetupBlock(whisperSetupState()?.task ?? null) : null
   if (setupBlocked) return { error: setupBlocked }
-  if (settings.transcriptionSource === 'local' && settings.localWhisperMode === 'builtin') {
+  if (transcribes && settings.transcriptionSource === 'local' && settings.localWhisperMode === 'builtin') {
     const whisper = await checkLocalWhisper(settings, { python: pythonPath, enginePath, env: runtimeEnvironment(), packaged: app.isPackaged })
     const blocked = localWhisperBlock(whisper, settings.localWhisperModel)
     if (blocked) {
@@ -98,7 +112,7 @@ export async function startClipJobRequest(request: unknown): Promise<StartJobRes
   ensureOutputDir(settings.outputDirectory)
 
   const jobId = randomUUID()
-  logger.info('job.start.request', { jobId, sourceType: isWebUrl(config.videoUrl) ? 'remote' : 'local', aspectRatio: config.aspectRatio })
+  logger.info('job.start.request', { jobId, sourceType: isWebUrl(config.videoUrl) ? 'remote' : 'local', aspectRatio: config.aspectRatio, resumed: !transcribes })
   try {
     createRunRecord(settings.outputDirectory, jobId, config.videoUrl)
   } catch {
@@ -106,6 +120,17 @@ export async function startClipJobRequest(request: unknown): Promise<StartJobRes
     return { error: 'Could not create the clipping run. Check the output folder and retry.' }
   }
   // Starts now when a slot is free; otherwise waits its turn in the queue.
-  const job = enqueueJob(jobId, config, settings.outputDirectory)
+  const job = enqueueJob(jobId, config, settings.outputDirectory, submitted)
   return { jobId, queued: job.status === 'queued', job }
+}
+
+/**
+ * Start a failed or cancelled job again from the transcript it saved. It is a new run with the
+ * same clip options and today's Settings, so a changed AI provider, endpoint, key or model
+ * applies, and the video is not transcribed again.
+ */
+export async function resumeClipJobRequest(jobId: unknown): Promise<StartJobResult> {
+  const resumable = typeof jobId === 'string' ? resumableJob(jobId) : null
+  if (!resumable) return { error: 'This job has no saved transcript to continue from. Use Run again instead.' }
+  return startClipJobRequest(resumable.request, { resumeTranscript: resumable.transcript })
 }

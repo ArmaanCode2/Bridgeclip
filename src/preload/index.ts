@@ -253,6 +253,8 @@ export interface BridgeClipAPI {
   job: {
     /** Queues a clipping run; it starts right away when a slot is free (`queued: false`). */
     start: (config: ClipJobRequest) => Promise<{ jobId?: string; queued?: boolean; job?: JobSnapshot; error?: string }>
+    /** Queues a failed or cancelled job again from its saved transcript, with the current Settings. */
+    resume: (jobId: string) => Promise<{ jobId?: string; queued?: boolean; job?: JobSnapshot; error?: string }>
     cancel: (jobId: string) => Promise<boolean>
     /** Every job the main process knows about this session, newest first. */
     list: () => Promise<JobSnapshot[]>
@@ -438,6 +440,7 @@ const api: BridgeClipAPI = {
   },
   job: {
     start: (config) => ipcRenderer.invoke('job:start', config),
+    resume: (jobId) => ipcRenderer.invoke('job:resume', jobId),
     cancel: (jobId) => ipcRenderer.invoke('job:cancel', jobId),
     list: () => ipcRenderer.invoke('jobs:list'),
     dismiss: (jobId) => ipcRenderer.invoke('jobs:dismiss', jobId),

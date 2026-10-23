@@ -52,6 +52,9 @@ def ai_provider_reason(error: BaseException) -> str | None:
     return None
 
 
+# A run continuing from an earlier run's transcript could not use it.
+SAVED_TRANSCRIPT_ERROR = "Saved transcript could not be reused"
+
 NO_CLIP_CANDIDATES_MESSAGE = 'The planner returned no clip candidates'
 NO_REQUESTED_MOMENTS_MESSAGE = 'No moments matched the clip request'
 
@@ -111,7 +114,7 @@ def safe_processing_error(error: Exception) -> str:
             "invalid_response": "Transcription response was invalid",
             "response_too_large": "Transcription response was too large",
         }.get(getattr(error, "reason", None), "Transcription failed")
-    if type(error).__name__ == "TranscriptionError":
+    if type(error).__name__ in ("TranscriptionError", "SavedTranscriptError"):
         return {
             "audio_extraction_failed": "Audio extraction failed",
             "audio_extraction_empty": "Audio extraction failed",
@@ -119,6 +122,7 @@ def safe_processing_error(error: Exception) -> str:
             "audio_chunk_failed": "Transcription audio preparation failed",
             "audio_chunk_too_large": "Transcription audio chunk exceeded the size limit",
             "missing_word_timestamps": "Transcription response lacked word timestamps",
+            "saved_transcript_unusable": SAVED_TRANSCRIPT_ERROR,
             **LOCAL_WHISPER_ERRORS,
         }.get(getattr(error, "reason", None), "Transcription failed")
     if type(error).__name__ == "RenderingError":
@@ -142,14 +146,14 @@ def safe_failure_code(error: Exception) -> str:
     reason = ai_provider_reason(error)
     if reason:
         return f"planning.ai_{reason}"
-    if type(error).__name__ in {"TranscriptionError", "TranscriptionProviderError"}:
+    if type(error).__name__ in {"TranscriptionError", "TranscriptionProviderError", "SavedTranscriptError"}:
         reason = getattr(error, "reason", "unknown")
         if reason in {
             "auth", "quota", "rate_limit", "network", "bad_request", "unavailable", "rejected", "invalid_response",
             "response_too_large", "source_missing", "audio_extraction_failed",
             "audio_extraction_empty", "audio_missing", "translation_unsupported",
             "audio_duration_unknown", "audio_chunk_failed", "audio_chunk_too_large",
-            "missing_word_timestamps", *LOCAL_WHISPER_ERRORS,
+            "missing_word_timestamps", "saved_transcript_unusable", *LOCAL_WHISPER_ERRORS,
         }:
             return f"transcription.{reason}"
         return "transcription.unknown"
@@ -182,6 +186,7 @@ def safe_job_error_text(error: str | None) -> str | None:
         "Audio duration could not be determined", "Transcription audio preparation failed",
         "Transcription audio chunk exceeded the size limit",
         "Transcription response lacked word timestamps",
+        SAVED_TRANSCRIPT_ERROR,
         "Video render failed",
         *LOCAL_WHISPER_ERRORS.values(),
         *AI_PROVIDER_ERRORS.values(),

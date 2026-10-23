@@ -2,7 +2,7 @@ import { SourcePreview } from './SourcePicker'
 import { JobDiagnostics } from './JobDiagnostics'
 import { StageBreakdown } from './StageBreakdown'
 import { useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, Clapperboard, Clock3, Gauge, Github, RotateCcw, ScrollText, TextSearch } from 'lucide-react'
+import { AlertTriangle, Clapperboard, Clock3, Gauge, Github, RotateCcw, ScrollText, StepForward, TextSearch } from 'lucide-react'
 import { formatTimecode, sourceLabel } from '../lib/utils'
 import { getApi } from '../lib/ipc'
 import { ISSUES_URL } from '../config/brand'
@@ -92,7 +92,40 @@ export function JobProgress({ job, onCancel, leading }: JobProgressProps): React
   )
 }
 
-export function JobFailure({ job, onRetry, leading }: { job: Job; onRetry: () => void; leading?: React.ReactNode }): React.JSX.Element {
+/**
+ * Actions for a failed or cancelled job. A run that saved its transcript can continue from it,
+ * so changing the AI provider, key or model in Settings does not mean transcribing again.
+ */
+export function RetryActions({ job, onRetry, onContinue, busy = false, iconClass = 'h-4 w-4' }: {
+  job: Job
+  onRetry: () => void
+  onContinue?: () => void
+  /** A start is in flight; a second click would queue a second run. */
+  busy?: boolean
+  iconClass?: string
+}): React.JSX.Element {
+  const resumable = Boolean(job.transcriptSaved && onContinue)
+  return (
+    <>
+      {resumable && <Button variant="primary" icon={<StepForward className={iconClass} />} onClick={onContinue} disabled={busy}
+        tooltip="Skips transcription. Uses this job’s clip options with your current Settings: AI provider, endpoint, key and model.">
+        Continue from transcript
+      </Button>}
+      <Button variant={resumable ? 'secondary' : 'primary'} icon={<RotateCcw className={iconClass} />} onClick={onRetry} disabled={busy}
+        tooltip={resumable ? 'Starts over, including transcription.' : undefined}>
+        Run again
+      </Button>
+    </>
+  )
+}
+
+export function JobFailure({ job, onRetry, onContinue, busy, leading }: {
+  job: Job
+  onRetry: () => void
+  onContinue?: () => void
+  busy?: boolean
+  leading?: React.ReactNode
+}): React.JSX.Element {
   const error = job.error || 'The clipping engine stopped without an error message.'
   const structuredError = useMemo(() => inspectJsonValue(error).encoded, [error])
   return (
@@ -126,10 +159,11 @@ export function JobFailure({ job, onRetry, leading }: { job: Job; onRetry: () =>
       </section>
 
       {job.stages && <div className="mt-4"><StageBreakdown stages={job.stages} /></div>}
+      {job.transcriptSaved && onContinue && <p className="mt-4 text-sm leading-relaxed text-ink-muted">
+        The transcript from this run is saved. Change the AI provider, endpoint, key or model in Settings if you need to, then continue without transcribing again.
+      </p>}
       <div className="mt-5 flex flex-wrap items-center gap-2">
-        <Button variant="primary" icon={<RotateCcw className="h-4 w-4" />} onClick={onRetry}>
-          Run again
-        </Button>
+        <RetryActions job={job} onRetry={onRetry} onContinue={onContinue} busy={busy} />
         <Button icon={<ScrollText className="h-4 w-4" />} onClick={() => getApi().diagnostics.openLogFolder()}>
           Show logs
         </Button>

@@ -54,7 +54,8 @@ def main():
     try:
         from clip_engine.logging_safety import install_safe_logging
         install_safe_logging()
-        raw = sys.stdin.read(16385)
+        # Electron writes UTF-8; text-mode stdin would use the Windows ANSI code page.
+        raw = sys.stdin.buffer.read(4 * 16384 + 4).decode('utf-8')
         if len(raw) > 16384:
             raise ValueError('Request too large')
         config = json.loads(raw)

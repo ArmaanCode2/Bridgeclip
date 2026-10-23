@@ -71,6 +71,8 @@ export interface JobSnapshot {
   failureStage?: string | null
   httpStatus?: number | null
   output: JobOutput | null
+  /** A failed or cancelled run that saved its transcript, so it can continue from it without transcribing again. */
+  transcriptSaved?: boolean
   /** The run folder inside the output directory. */
   outputDir: string
   queuedAt: string

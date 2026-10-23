@@ -18,7 +18,8 @@ import type { OpenRouterModel } from '../shared/openrouter-models'
 import { finishRunRecord, type StoredRunStatus } from './run-history'
 import { resolveBinary } from './tools'
 
-export type ClipJobConfig = ClipJobRequest & { plannerCapabilities?: OpenRouterModel }
+/** `resumeTranscript` is set by main only: the transcript.json of an earlier run to continue from. */
+export type ClipJobConfig = ClipJobRequest & { plannerCapabilities?: OpenRouterModel; resumeTranscript?: string }
 
 /**
  * Where a run's events go. The job manager passes its own sink so it can track
@@ -85,6 +86,14 @@ export interface JobErrorPayload {
   bridgePath?: string
   enginePath?: string
   hint?: string
+}
+
+/** NTSTATUS exit codes of a crashed Windows process, e.g. 3221225477 for an access violation. */
+const WINDOWS_CRASH_NAMES: Record<number, string> = {
+  0xC0000005: 'access violation',
+  0xC0000017: 'out of memory',
+  0xC00000FD: 'stack overflow',
+  0xC0000409: 'aborted by a library'
 }
 
 const activeProcesses = new Map<string, ChildProcess>()
@@ -401,7 +410,7 @@ export function startClipJob(
   // A job can wait in the queue while the provider choices change. The start-time check ran against
   // the choices of that moment, so run it again against today's: a job whose provider was switched or
   // whose key was removed stops with a plain reason instead of failing inside the engine.
-  const gate = gateJobStart(settings, queuedConfig)
+  const gate = gateJobStart(settings, queuedConfig, { transcribes: !queuedConfig.resumeTranscript })
   const config: ClipJobConfig = gate.ok
     ? { ...queuedConfig, clippingMode: gate.clippingMode, ...(gate.layoutVision !== undefined ? { layoutVision: gate.layoutVision } : {}) }
     : queuedConfig
@@ -477,6 +486,7 @@ export function startClipJob(
       planner_output_price: config.plannerCapabilities?.outputPrice ?? null
     } : {}),
     ...(config.clipRequest ? { clip_request: config.clipRequest } : {}),
+    ...(config.resumeTranscript ? { resume_transcript: config.resumeTranscript } : {}),
     max_clips: config.maxClips,
     auto_clip_count: config.autoClipCount,
     duration_ranges: config.durationRanges,
@@ -715,6 +725,11 @@ export function startClipJob(
       // uv_spawn itself failed. -2 == UV_ENOENT.
       message = `Pipeline failed to start (libuv errno ${code}). The Python interpreter or bridge script could not be spawned.`
       hint = 'Open Settings and run System check.'
+    } else if (process.platform === 'win32' && typeof code === 'number' && code >= 0xC0000000) {
+      // Windows reports a crash in native code (Whisper, OpenCV, PyAV) as an NTSTATUS exit code.
+      const name = WINDOWS_CRASH_NAMES[code]
+      message = `The clipping engine crashed (Windows error 0x${code.toString(16).toUpperCase()}${name ? `, ${name}` : ''}).`
+      hint = 'A native library inside the engine failed. If it stopped while transcribing with Local Whisper, choose CPU or a smaller model in Settings → AI & transcription and run again.'
     } else {
       message = `Pipeline exited with code ${code}.`
     }
