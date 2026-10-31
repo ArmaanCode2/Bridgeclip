@@ -22,7 +22,7 @@ Copies run from source, local package builds and apps opened straight from the d
 
 ## Create your first clips
 
-1. Add an [OpenRouter API key](https://openrouter.ai/keys) with available credit in the setup card. A saved key is never shown again; paste a new one to replace it, or choose **Remove key** in Settings.
+1. Add an [OpenRouter API key](https://openrouter.ai/keys) with available credit in the setup card, or choose **Claude plan** to use your Claude plan through Claude Code, with no key. A saved key is never shown again; paste a new one to replace it, or choose **Remove key** in Settings.
 2. Open **Create** and use the file picker for a local video, or paste a public YouTube or completed Twitch VOD link. Dropping a local file opens the picker so you can grant access.
 3. Choose **Automatic** for finished exports, or **Review & edit** to adjust candidates in the [editor](editor.md).
 4. Choose format, framing, clip lengths, models and caption style, then generate.
@@ -36,7 +36,7 @@ Only download or clip material you have permission to use. Remote sites may limi
 
 In **Create**, choose a workflow before continuing: **Automatic · Beginner friendly** finds and exports clips; **Review & edit · For advanced users** lets you choose and adjust candidates before export. Each new video starts with neither workflow selected. YouTube links show a video card with its title, channel and thumbnail, plus duration, views and upload date when available. Metadata loads in the background and never blocks clip setup.
 
-**Review & edit** always reviews candidates: with Jev on OpenRouter, or with your own model on Gemini or an OpenAI-compatible endpoint. For Automatic, the review is off by default. On OpenRouter, reviews use OpenRouter credit; see [review behavior and costs](ai-and-privacy.md#jev-editorial-review).
+**Review & edit** always reviews candidates: with Jev on OpenRouter, or with your own model on the Claude plan, Gemini or an OpenAI-compatible endpoint. For Automatic, the review is off by default. On OpenRouter, reviews use OpenRouter credit; see [review behavior and costs](ai-and-privacy.md#jev-editorial-review).
 
 ### How clips are picked
 
@@ -64,7 +64,7 @@ In **Create → Clips**, choose **Quality**, **Economy**, or **Advanced**. Advan
 
 ### Framing, captions and speed
 
-Smart framing follows faces and arranges screen shares with facecams shot by shot. Optional AI vision checks help with ambiguous layouts and can add OpenRouter cost. Use [Review & edit](editor.md) to adjust crops and camera changes before exporting.
+Smart framing follows faces and arranges screen shares with facecams shot by shot. Optional AI vision checks help with ambiguous layouts and can add OpenRouter cost. On the Claude plan they need **Read images** on, and use more of your plan. Use [Review & edit](editor.md) to adjust crops and camera changes before exporting.
 
 Without an AI that reads images, BridgeClip finds the webcam itself. A small face that stays in one place near an edge of the frame is the webcam: in a corner, or at the bottom centre or the middle of a side when a border is found around it and the face is changing. A face that roams around next to your webcam is treated as part of the game, and a face that never changes while the game moves (a frozen portrait) is never the webcam. When several faces could be the webcam, the one that looks most like one wins. A border found around it counts most; being there through the whole clip and the whole shot, and a head that moves a little around one place, count next; a face that changes and a usual webcam size count a little. A face that holds pixel-still over two seconds or more (a game's character portrait) counts against itself, even when video compression makes the portrait look as if it changes. While following the webcam through a shot, one missed detection never hands it to another face, and faces that sit still elsewhere through the shot are never followed. A face in the game that is there all the time, moves like a person and has a frame around it can still be mistaken for the webcam; choose **Webcam in your videos** for that. The webcam's box comes from the edges that stay put while the game around them moves, so an overlay is cropped to its real edges whether or not it has a drawn border; an AI that reads images keeps its own box unless the two agree. When no face at all turns up at the usual detection size in a shot of at least 3 seconds, five sharper frames (twice the detection size, 1280 by 720 for a 1080p video) from up to 20 seconds of the shot are checked for a small, changing webcam face, for up to six shots per clip. That adds a few seconds per shot, and a webcam found that way must stay in place for the whole shot.
 
@@ -114,7 +114,7 @@ Select clips to reveal the red trash button for deleting just those exports, wit
 
 Library overview cards show the total clip count at the top left and separate **Posted** / **Not Posted** counts below the title. Bookmark a run to keep it in the **Bookmarked** section. Cards move smoothly between Bookmarked and Recent runs without reloading their thumbnails; removing the last bookmark returns to one **All runs** grid. Bookmarks persist across restarts, and reduced-motion preferences turn off movement.
 
-The trash action asks for confirmation before permanently deleting the run folder, all clips and other files inside it, and cached clip previews. It does not remove published social posts or copies stored elsewhere. Active runs cannot be deleted.
+The trash action asks for confirmation before permanently deleting the run folder, all clips and other files inside it, and cached clip previews. It does not remove published social posts or copies stored elsewhere. On a run made with the Claude plan, it also removes any Claude Code session that run listed, though normally there is none. Active runs cannot be deleted.
 
 **Settings → About → Content storage** shows the total file size and file count in your output folder. Refresh to recalculate; inaccessible files are reported as a partial total.
 

@@ -10,7 +10,7 @@
 <p align="center">
   An open-source desktop app from <a href="https://www.bridgemind.ai">BridgeMind</a>.
   Find moments in podcasts, streams and interviews, refine the edit, and export clips for your audience.
-  Video rendering runs on your computer; AI uses your own OpenRouter, Google Gemini or OpenAI-compatible key, and transcription can run on your computer with Whisper.
+  Video rendering runs on your computer; AI uses your own OpenRouter, Google Gemini or OpenAI-compatible key or your Claude plan, and transcription can run on your computer with Whisper.
 </p>
 
 <p align="center">
@@ -43,7 +43,7 @@ This README describes the current source. Check the [release notes](https://gith
 
 ## Quick start
 
-You need an AI provider: an **[OpenRouter API key](https://openrouter.ai/keys) with available credit** (the default), or your own **Google Gemini** or **OpenAI-compatible** key. Transcription can use OpenRouter or **Whisper running on your computer**, which needs no key. No BridgeMind account is required.
+You need an AI provider: an **[OpenRouter API key](https://openrouter.ai/keys) with available credit** (the default), your own **Google Gemini** or **OpenAI-compatible** key, or your **Claude plan** through Claude Code on your computer. Transcription can use OpenRouter or **Whisper running on your computer**, which needs no key. No BridgeMind account is required.
 
 1. **Connect your key.** Paste it into the first-launch setup card.
 2. **Add a video.** Choose a local file, a public YouTube link, or a public, completed Twitch VOD.
@@ -102,7 +102,7 @@ Use footage you have permission to use. See the [user guide](docs/usage.md) for 
 
 ## AI, costs and privacy
 
-**Rendering is local; AI processing uses cloud providers.** By default, audio and transcripts go to OpenRouter; with Gemini or an OpenAI-compatible endpoint, the transcript goes to that provider, and with local Whisper the audio stays on your computer. Visual-only planning and enabled AI framing checks can send sampled frames. Your videos and keys do not pass through a BridgeMind server.
+**Rendering is local; AI processing uses cloud providers.** By default, audio and transcripts go to OpenRouter; with Gemini, an OpenAI-compatible endpoint or the Claude plan, the transcript goes to that provider, and with local Whisper the audio stays on your computer. Visual-only planning and enabled AI framing checks can send sampled frames. Your videos and keys do not pass through a BridgeMind server.
 
 - **Bring your own accounts.** AI calls bill the provider you chose, OpenRouter by default. Optional social publishing uses your Zernio account and uploads selected clips to its service.
 - **Choose additional analysis.** Jev review for Automatic, source web research and additional visual context are opt-in betas. Review & edit always uses Jev; these features can add provider cost.

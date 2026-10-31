@@ -9,6 +9,7 @@ flowchart LR
   Engine -->|audio for MAI Transcribe 2| OpenRouter
   Engine -->|transcript or sampled frames| OpenRouter
   Engine -->|transcript, chosen in Settings| Gemini[Gemini or OpenAI-compatible endpoint]
+  Engine -->|transcript and frames on stdin, chosen in Settings| ClaudeCode[Claude Code on this computer]
   Engine -->|audio, local Whisper only| LocalWhisper[Whisper on this computer or a local server]
   Engine -->|clips, transcript, plan| Library[Local output folder]
   Main -->|optional account, media and post API| Zernio[Zernio]
@@ -116,6 +117,20 @@ records include the search intervals/status, discovery pass, anchors, speaker la
 repair citations and visual attempts; old traces remain readable.
 
 Visual observation time is budgeted across active sampling/request work; waiting for other candidates or repairs does not exhaust the 90-second visual-work allowance.
+
+### The Claude plan provider
+
+The Claude plan is a provider like the others from the engine's side. `ai_client.get_ai_client` returns an httpx client whose transport (`services/claude_plan.py`) starts one hidden Claude Code run per request instead of opening a connection, turns the OpenAI-style payload into a stream-json user message (image parts become image blocks), and returns an OpenAI-style reply, so the planner, judges, reviews and framing checks send their requests as they do to any provider.
+
+Main owns how a run starts: `src/main/claude-plan/runner.ts` resolves the program and passes the engine one JSON setting holding the command, an allowlisted environment, an empty working folder and the job's session list. The engine never falls back to its own environment, which holds keys. Runs have no tools, read no Claude Code settings (`--setting-sources ""`), are told to save no session and are tied to the engine by a Windows job object, so an engine crash ends them when Windows allows the tie. At most two run at once per job. A run that reports an API key as its source stops the job, as does one that reports paid overflow.
+
+Some steps can be skipped when a request fails, which suits a passing failure but would hide a plan that has run out. So a failure every later request would hit is remembered for the job: later requests fail without starting a run, and the pipeline and the review call `raise_if_stopped` before moving on. In an Automatic job framing runs after that last check and falls back to face tracking; in Review & edit it runs before each candidate's review, which then stops the job.
+
+Test connection and metadata writing ask from main (`src/main/claude-plan/chat.ts`) with the same restrictions. Each engine run's id goes into `claude-sessions.txt` in the job's folder before it starts. Deleting the job removes those ids from the one folder Claude Code keeps for BridgeClip's workspace (`src/main/claude-plan/sessions.ts`), which must be a real folder, not a link. It normally finds nothing, since no session is saved, and it copies Claude Code's folder naming, so a change there makes it find nothing rather than the wrong thing. Runs from main are not listed.
+
+### Length repair and the final set check
+
+Automatic planning (no Jev, not longform) checks each searched part's picks against the clip lengths the person chose. Picks more than half a second outside them get one follow-up request per part (`length_repair.py`): the model sees those picks with the transcript from a minute before to a minute after each, inside the part, and returns each moment at an allowed length or leaves it out. Valid answers replace the times; emphasis words not spoken in the new span are dropped. A failed or unusable answer keeps the original picks, which then get the usual padding and trimming; a clip that boundary snapping leaves less than a second short is padded rather than dropped. After all parts (and the clip judge, when it runs), one request over the whole candidate set (`final_check.py`, skipped for a clip request, Jev, longform or fewer than four candidates) names clips that repeat an incident and titles that repeat another title's wording. A repeat is left out only when the clip kept scores at least as high, and at most a quarter of the set; renamed titles must be 2-7 words. Both requests are recorded in the edit trace with a `kind` of `repair` or `final_check`, count toward planning cost, and never fail a plan.
 
 ### Screen content in split views
 

@@ -8,6 +8,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Mai
 
 ### Added
 
+- **Claude plan** in Settings → AI & transcription: pick clips with your own Claude plan through Claude Code on your computer, with no API key. Choose the model and effort, and turn on **Read images** to let Claude check framing. Run stats show picks as included in your plan. BridgeClip tells Claude Code not to save sessions for these runs, and deleting a finished job from the Library removes any session it left anyway.
+- **Continue from transcript**: a job that failed or was stopped after transcribing keeps its transcript, so until you close BridgeClip you can change your model or key and carry on without transcribing again.
+- **Saved model cards**: save each OpenAI-compatible endpoint with its model and key as a card, then click a card to use it.
+- Clip planning now fixes picks that miss your chosen length, and drops clips that repeat the same moment.
 - **What to clip** in Create → Clips: describe the moments you want, such as "every time they talk about pricing". Leave it blank to get the strongest moments as before.
 - **Show title at the top** in Create → Captions turns off the title card on Automatic clips.
 - **Review & edit** workflow: look over clip candidates before exporting. Trim, split and extend cuts, change layouts and camera changes, fix and place captions, then bake one clip or every ready clip with **Bake all**. You can also swap in a higher-quality copy of the source video.
