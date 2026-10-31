@@ -384,7 +384,7 @@ export function createBridgeClipTools(host: ToolHost): AssistantToolSpec[] {
         const chosen = loadSettings()
         const usage = chosen.aiProvider === 'openrouter'
           ? (chosen.transcriptionSource === 'cloud' ? 'Uses your OpenRouter credit for transcription and planning.' : 'Uses your OpenRouter credit for planning. Transcription runs on this computer.')
-          : `Uses your ${AI_PROVIDER_LABELS[chosen.aiProvider]} account for planning. ${chosen.transcriptionSource === 'cloud' ? 'Transcription uses your OpenRouter credit.' : 'Transcription runs on this computer.'}`
+          : `Uses your ${chosen.aiProvider === 'claude-plan' ? 'Claude plan' : `${AI_PROVIDER_LABELS[chosen.aiProvider]} account`} for planning. ${chosen.transcriptionSource === 'cloud' ? 'Transcription uses your OpenRouter credit.' : 'Transcription runs on this computer.'}`
         return [
           `Video: ${label}`,
           `${input.workflow === 'review' ? 'Review & edit' : 'Automatic'} · ${input.mode === 'economy' ? 'Economy' : 'Quality'} · ${input.aspectRatio ?? '9:16'}${input.speed && input.speed !== 1 ? ` · ${input.speed}×` : ''}`,
@@ -1103,6 +1103,7 @@ export function createBridgeClipTools(host: ToolHost): AssistantToolSpec[] {
           ...(settings.transcriptionSource === 'local' ? { localWhisperMode: settings.localWhisperMode, localWhisperModel: settings.localWhisperModel } : {}),
           ...(settings.aiProvider === 'gemini' ? { geminiModel: settings.geminiModel } : {}),
           ...(settings.aiProvider === 'openai-compatible' ? { openaiCompatibleModel: settings.openaiCompatibleModel } : {}),
+          ...(settings.aiProvider === 'claude-plan' ? { claudePlanModel: settings.claudePlanModel, claudePlanEffort: settings.claudePlanEffort } : {}),
           openrouterKeySaved: settings.openrouterConfigured,
           geminiKeySaved: settings.geminiConfigured,
           openaiCompatibleKeySaved: settings.openaiCompatibleConfigured,

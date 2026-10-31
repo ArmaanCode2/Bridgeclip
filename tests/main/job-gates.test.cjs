@@ -120,12 +120,15 @@ test('setup gaps, readiness and labels agree for each provider and transcription
   assert.deepEqual(setupGaps(input({ aiProvider: 'gemini' })).map((g) => g.id), ['gemini-key', 'openrouter-key'])
   assert.deepEqual(setupGaps(input({ aiProvider: 'gemini', transcriptionSource: 'local' })).map((g) => g.id), ['gemini-key'])
   assert.deepEqual(setupGaps(input({ aiProvider: 'gemini', geminiConfigured: true, transcriptionSource: 'local' })), [])
-  // OpenAI-compatible needs a URL and a model, not a key.
-  assert.deepEqual(setupGaps(input({ aiProvider: 'openai-compatible', transcriptionSource: 'local' })).map((g) => g.id), ['openai-url', 'openai-model'])
+  // OpenAI-compatible needs a chosen saved model (which carries the URL and model), not a key.
+  const noModel = setupGaps(input({ aiProvider: 'openai-compatible', transcriptionSource: 'local' }))
+  assert.deepEqual(noModel.map((g) => g.id), ['openai-model'])
+  assert.match(noModel[0].message, /Choose one of your saved models, or add one/)
+  assert.equal(describeGaps(noModel), 'Add a model')
   assert.deepEqual(setupGaps(input({ aiProvider: 'openai-compatible', openaiCompatibleUrl: 'http://x/v1', transcriptionSource: 'local' })).map((g) => g.id), ['openai-model'])
   assert.deepEqual(setupGaps(input({ aiProvider: 'openai-compatible', openaiCompatibleUrl: 'http://x/v1', openaiCompatibleModel: 'm', transcriptionSource: 'local' })), [])
   // Whitespace is not a value.
-  assert.deepEqual(setupGaps(input({ aiProvider: 'openai-compatible', openaiCompatibleUrl: '  ', openaiCompatibleModel: ' ', transcriptionSource: 'local' })).map((g) => g.id), ['openai-url', 'openai-model'])
+  assert.deepEqual(setupGaps(input({ aiProvider: 'openai-compatible', openaiCompatibleUrl: '  ', openaiCompatibleModel: ' ', transcriptionSource: 'local' })).map((g) => g.id), ['openai-model'])
   // Local Whisper: built-in needs nothing, server needs a URL.
   assert.deepEqual(setupGaps(input({ openrouterConfigured: true, transcriptionSource: 'local', localWhisperMode: 'builtin' })), [])
   assert.deepEqual(setupGaps(input({ openrouterConfigured: true, transcriptionSource: 'local', localWhisperMode: 'server' })).map((g) => g.id), ['whisper-url'])

@@ -41,6 +41,76 @@ test('favorites persist across reloads and are returned in Library history', asy
   } finally { f.cleanup() }
 })
 
+/** Claude Code's folder for BridgeClip's workspace, in a test's own user data, with one saved session. */
+function savedSession(f, id) {
+  const workspace = path.join(f.dir, 'userData', 'claude-plan', 'workspace')
+  fs.mkdirSync(workspace, { recursive: true })
+  const project = path.join(f.dir, 'claude', 'projects', fs.realpathSync(workspace).replace(/[^A-Za-z0-9]/g, '-'))
+  fs.mkdirSync(project, { recursive: true })
+  fs.writeFileSync(path.join(project, `${id}.jsonl`), 'x')
+  return project
+}
+
+test('deleting a run removes the Claude sessions its job listed, and only those', async (t) => {
+  const f = fixture()
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = path.join(f.dir, 'claude')
+  t.after(() => { if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = saved })
+  try {
+    const listed = '11111111-2222-4333-8444-555555555555'
+    const unrelated = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    const project = savedSession(f, listed)
+    fs.writeFileSync(path.join(project, `${unrelated}.jsonl`), 'x')
+    fs.writeFileSync(path.join(f.run, 'claude-sessions.txt'), `${listed}\n`)
+    await f.main.deleteLibraryRun(f.run)
+    assert.equal(fs.existsSync(f.run), false)
+    assert.deepEqual(fs.readdirSync(project), [`${unrelated}.jsonl`])
+  } finally { f.cleanup() }
+})
+
+test('finishing an interrupted deletion cleans up its Claude sessions too', async (t) => {
+  const f = fixture()
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = path.join(f.dir, 'claude')
+  t.after(() => { if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = saved })
+  try {
+    const listed = '11111111-2222-4333-8444-555555555555'
+    const project = savedSession(f, listed)
+    const interrupted = path.join(f.library, `.deleting-${listed}`)
+    fs.mkdirSync(interrupted)
+    fs.writeFileSync(path.join(interrupted, 'claude-sessions.txt'), `${listed}\n`)
+    await f.main.sweepDeletingRuns()
+    assert.equal(fs.existsSync(interrupted), false)
+    assert.deepEqual(fs.readdirSync(project), [])
+  } finally { f.cleanup() }
+})
+
+test('a run still deletes when Claude’s folder cannot be cleaned', async (t) => {
+  const f = fixture()
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  // A file where the folder should be: every step of the cleanup fails.
+  process.env.CLAUDE_CONFIG_DIR = path.join(f.dir, 'claude-is-a-file')
+  fs.writeFileSync(process.env.CLAUDE_CONFIG_DIR, 'x')
+  t.after(() => { if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = saved })
+  try {
+    fs.writeFileSync(path.join(f.run, 'claude-sessions.txt'), '11111111-2222-4333-8444-555555555555\n')
+    await f.main.deleteLibraryRun(f.run)
+    assert.equal(fs.existsSync(f.run), false)
+  } finally { f.cleanup() }
+})
+
+test('deleting a run with no Claude sessions touches nothing of Claude’s', async (t) => {
+  const f = fixture()
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = path.join(f.dir, 'claude')
+  t.after(() => { if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = saved })
+  try {
+    await f.main.deleteLibraryRun(f.run)
+    assert.equal(fs.existsSync(path.join(f.dir, 'claude')), false)
+    assert.equal(fs.existsSync(path.join(f.dir, 'userData', 'claude-plan')), false, 'no folder is made for a run on another provider')
+  } finally { f.cleanup() }
+})
+
 test('manual posted marks persist, undo independently, and validate clip IDs and run state', async () => {
   const f = fixture()
   try {

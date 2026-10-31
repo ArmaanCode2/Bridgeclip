@@ -190,6 +190,7 @@ test('the native picker authorizes media and shell opening rejects aliased appli
       './job-manager': { initJobManager() {} },
       './job-start': {},
       './provider-checks': {},
+      './assistant/providers': {},
       './whisper-models': {},
       './whisper-setup': {},
       './logger': {},
@@ -399,7 +400,7 @@ test('engine checks distinguish missing modules, models, contracts and timeouts 
   }
   const runner = loadSource('pipeline-runner.ts', {
     electron: { app }, child_process: { execFile },
-    './settings-store': {}, './job-gates': {}, './logger': {}, '../shared/job-output': {},
+    './settings-store': {}, './job-gates': {}, './claude-plan/runner': {}, './logger': {}, '../shared/job-output': {},
     '../shared/job-contract': jobContract, './run-history': {}, './tools': {}
   })
   const check = () => runner.validatePython('/project with spaces/.venv/bin/python', '/project with spaces/engine')
@@ -463,7 +464,7 @@ test('Windows resolves the saved legacy Python default without replacing an inst
       assert.deepEqual(Array.from(args), ['-c', 'import sys; assert sys.version_info[0] == 3'])
       if (!python3Runnable) throw new Error('Python is unavailable')
     } },
-    './settings-store': {}, './job-gates': {}, './logger': {}, '../shared/job-output': {},
+    './settings-store': {}, './job-gates': {}, './claude-plan/runner': {}, './logger': {}, '../shared/job-output': {},
     '../shared/job-contract': {}, './run-history': {}, './tools': {}
   }, { process: winProcess })
 
@@ -642,6 +643,7 @@ test('pipeline preserves split JSON messages and protects the job identity', asy
     } },
     './settings-store': { loadSettings: () => settings, getSettingsForBridge: () => ({}), vocabularyTerms: () => [] },
     './job-gates': jobGates,
+    './claude-plan/runner': { claudePlanEnvironment: () => ({}) },
     './logger': { logger: { info() {}, error() {}, warn() {} } },
     '../shared/job-output': jobOutput,
     './run-history': runHistory,
@@ -694,6 +696,7 @@ test('pipeline rejects a mismatched result identity and a failed process exit', 
       child_process: { execFile: require('node:child_process').execFile, spawn: () => child },
       './settings-store': { loadSettings: () => settings, getSettingsForBridge: () => ({}), vocabularyTerms: () => [] },
       './job-gates': jobGates,
+      './claude-plan/runner': { claudePlanEnvironment: () => ({}) },
       './logger': { logger: { info() {}, error() {}, warn() {} } },
       '../shared/job-output': jobOutput,
       './run-history': runHistory,
@@ -713,6 +716,36 @@ test('pipeline rejects a mismatched result identity and a failed process exit', 
   }
 })
 
+test('a queued job on the Claude plan stops with a plain reason when Claude Code has gone, and spawns nothing', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bridgeclip-claude-gone-'))
+  const settings = { outputDirectory: root, pythonPath: 'python3', enginePath: root, aiProvider: 'claude-plan' }
+  const asked = []
+  const runner = loadSource('pipeline-runner.ts', {
+    electron: { app: { isPackaged: false, getPath: () => TEST_WORK_HOME } },
+    fs: { ...fs, existsSync: () => true },
+    child_process: { execFile: require('node:child_process').execFile, spawn: () => { throw new Error('nothing may start') } },
+    './settings-store': { loadSettings: () => settings, getSettingsForBridge: () => ({}), vocabularyTerms: () => [] },
+    './job-gates': { ...jobGates, gateJobStart: () => ({ ok: true, clippingMode: 'quality', layoutVision: false }) },
+    './claude-plan/runner': { claudePlanEnvironment: (provider, deps) => { asked.push({ provider, runFolder: deps.runFolder }); return {} } },
+    './logger': { logger: { info() {}, error() {}, warn() {} } },
+    './run-history': runHistory,
+    '../shared/job-output': jobOutput,
+    '../shared/job-contract': jobContract,
+    './tools': { resolveBinary: () => 'ffmpeg' }
+  }, { queueMicrotask })
+  const sent = []
+  const window = { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: (channel, data) => sent.push({ channel, data }) } }
+  let exited = false
+  try {
+    runner.startClipJob('job-claude', { videoUrl: 'https://www.youtube.com/watch?v=abc123def45' }, window, () => { exited = true })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.match(sent.find((event) => event.channel === 'job:error').data.message, /could not find Claude Code/)
+    assert.equal(exited, true)
+    // The job's own folder is where its runs get listed.
+    assert.deepEqual(asked, [{ provider: 'claude-plan', runFolder: path.join(root, 'job-claude') }])
+  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+})
+
 test('a bridge failure is saved in run history before the UI receives it', async () => {
   const { PassThrough } = require('node:stream')
   const { EventEmitter } = require('node:events')
@@ -730,6 +763,7 @@ test('a bridge failure is saved in run history before the UI receives it', async
     child_process: { execFile: require('node:child_process').execFile, spawn: () => child },
     './settings-store': { loadSettings: () => settings, getSettingsForBridge: () => ({}), vocabularyTerms: () => [] },
     './job-gates': jobGates,
+    './claude-plan/runner': { claudePlanEnvironment: () => ({}) },
     './logger': { logger: { info() {}, error(event, context) { logs.push({ event, context }) }, warn() {} } },
     './run-history': runHistory,
     '../shared/job-output': jobOutput,
@@ -792,6 +826,7 @@ test('cancellation retains a live process group after the leader closes and forc
     child_process: { execFile: require('node:child_process').execFile, spawn: () => child },
     './settings-store': { loadSettings: () => settings, getSettingsForBridge: () => ({}), vocabularyTerms: () => [] },
     './job-gates': jobGates,
+    './claude-plan/runner': { claudePlanEnvironment: () => ({}) },
     './logger': { logger: { info() {}, error() {}, warn() {} } },
     '../shared/job-output': jobOutput,
     './run-history': runHistory,
@@ -870,7 +905,7 @@ test('Jev migration drops the separate TypeSafe key without decrypting it', () =
     assert.equal(loaded.jevEnabled, 'off')
     assert.equal(loaded.jevVisualContext, 'on')
     const saved = JSON.parse(fs.readFileSync(file, 'utf8'))
-    assert.equal(saved.version, 12)
+    assert.equal(saved.version, 14)
     assert.equal(Object.hasOwn(saved, 'typesafeApiKey'), false)
     assert.equal(Object.hasOwn(saved, 'typesafeVisualContext'), false)
     assert.equal(Object.hasOwn(loaded, 'typesafeApiKey'), false)
@@ -894,7 +929,7 @@ test('Jev thresholds migrate, validate atomically, persist, and reach the worker
     const defaults = [.75, .70, .65, .70, .80, .50, .95]
     const initial = store.publicSettings(store.loadSettings())
     keys.forEach((key, i) => assert.equal(Number(initial[key]), defaults[i]))
-    assert.equal(JSON.parse(fs.readFileSync(file)).version, 12)
+    assert.equal(JSON.parse(fs.readFileSync(file)).version, 14)
     const values = ['0', '1', '0.61', '0.72', '0.83', '0.54', '0.96']
     const saved = store.savePublicSettings({ ...initial, ...Object.fromEntries(keys.map((key, i) => [key, values[i]])) })
     const worker = store.getSettingsForBridge(store.loadSettings())
@@ -947,7 +982,7 @@ test('Jev review and web research stay opt-in across upgrades, downgrades and mi
       assert.equal(loaded.openrouterApiKey, 'kept-openrouter')
       assert.equal(loaded.jevEnabled, 'off', `v${version} loads Jev off`)
       assert.equal(loaded.sourceContextWebResearch, 'off', `v${version} loads research off`)
-      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).version, 12)
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).version, 14)
     }
     // An explicit opt-in on the current version survives a reload.
     store.savePublicSettings({ ...store.publicSettings(store.loadSettings()), jevEnabled: 'on', sourceContextWebResearch: 'on' })

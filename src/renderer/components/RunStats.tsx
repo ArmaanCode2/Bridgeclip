@@ -81,7 +81,16 @@ export function RunStats({ output, costs, videoSpeed }: RunStatsProps): React.JS
     />
   )
   const untracked = costNotTracked(costs)
-  const costCell = untracked && costs ? (
+  const costCell = costs?.planning?.provider === 'claude-plan' ? (
+    <StatCell
+      index={2}
+      icon={<CircleDollarSign />}
+      label="API cost"
+      value={costs.total_estimated_cost_usd > 0 ? formatUsd(costs.total_estimated_cost_usd) : 'Included'}
+      final={costs.total_estimated_cost_usd > 0 ? formatUsd(costs.total_estimated_cost_usd) : 'Included'}
+      sub={costs.total_estimated_cost_usd > 0 ? 'Picks in your Claude plan' : 'In your Claude plan'}
+    />
+  ) : untracked && costs ? (
     <StatCell
       index={2}
       icon={<CircleDollarSign />}

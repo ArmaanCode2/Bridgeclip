@@ -253,6 +253,20 @@ class TestPlanClips:
         assert safe_processing_error(failure.value) == "Selected planner requires a video with speech"
         assert safe_failure_code(failure.value) == "planning.images_unsupported"
 
+    def test_a_silent_video_on_the_claude_plan_says_read_images_is_off(self):
+        from clip_engine.error_policy import safe_failure_code, safe_processing_error
+        from clip_engine.services.ai_client import AiClientError
+        planner = make_planner(ai_provider="claude-plan", claude_plan_vision=False)
+        with pytest.raises(AiClientError) as failure:
+            asyncio.run(planner.plan_clips(
+                transcript_result=TranscriptionResult(segments=[], full_text="", duration_seconds=300),
+                video_metadata=SimpleNamespace(duration_seconds=300), max_clips=3, auto_clip_count=False,
+                min_duration_seconds=15, max_duration_seconds=60,
+                frames=[SimpleNamespace(timestamp_ms=time) for time in (0, 10000, 20000)],
+            ))
+        assert safe_processing_error(failure.value) == "Read images is off for your Claude plan"
+        assert safe_failure_code(failure.value) == "planning.ai_images_off"
+
     def test_advanced_cost_estimate_uses_selected_model_catalog_price(self, no_sleep):
         planner = make_planner(clipping_mode="advanced", planner_model="custom/model", planner_input_price=0.000001, planner_output_price=0.000005)
         result = self._plan(planner, [(200, completion(json.dumps({"clips": [clip(10, 40)]}), model="custom/model", cost=None))])

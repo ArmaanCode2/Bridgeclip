@@ -13,7 +13,7 @@ const bundled = buildSync({
       export { WorkflowPicker } from './src/renderer/components/WorkflowPicker';
       export { JevSettings } from './src/renderer/components/JevSettings';
       export { RunStats } from './src/renderer/components/RunStats';
-      export { ProviderPicker, ProviderFields, TranscriptionSettings, CheckList } from './src/renderer/components/ProviderSetup';
+      export { ProviderPicker, ProviderFields, TranscriptionSettings, CheckList, ModelPresetForm } from './src/renderer/components/ProviderSetup';
       export { useApiKeyDrafts } from './src/renderer/hooks/use-api-key-drafts';
       export { useSettingsStore, useSetupState } from './src/renderer/store/use-settings-store';
       export { useDraftStore } from './src/renderer/store/use-draft-store';
@@ -299,6 +299,7 @@ const TOOLS_OK = { python: true, pythonDeps: true, ffmpeg: true, ffprobe: true, 
 const NOTHING_SET = {
   aiProvider: 'openrouter', openrouterConfigured: false, geminiConfigured: false, openaiCompatibleConfigured: false,
   openaiCompatibleUrl: '', openaiCompatibleModel: '', openaiCompatibleVision: 'off', geminiModel: 'gemini-3.8-flash',
+  modelPresets: [], activeModelPreset: '', claudePlanModel: 'sonnet', claudePlanEffort: 'medium', claudePlanVision: 'off',
   transcriptionSource: 'cloud', localWhisperMode: 'builtin', localWhisperUrl: '', localWhisperModel: 'small',
   jevEnabled: 'off', toolStatus: TOOLS_OK, toolError: null, checkingTools: false
 }
@@ -373,8 +374,8 @@ test('setup state: each provider and transcription choice reports exactly what i
   const local = setupState({ aiProvider: 'gemini', geminiConfigured: true, transcriptionSource: 'local' })
   assert.deepEqual([local.gaps.length, local.ready, local.summary], [0, true, ''])
   assert.deepEqual(ids(setupState({ aiProvider: 'gemini', transcriptionSource: 'local' })), ['gemini-key'])
-  // OpenAI-compatible needs a URL and a model; the key is optional.
-  assert.deepEqual(ids(setupState({ aiProvider: 'openai-compatible', transcriptionSource: 'local' })), ['openai-url', 'openai-model'])
+  // OpenAI-compatible needs a chosen saved model (its URL and model); the key is optional.
+  assert.deepEqual(ids(setupState({ aiProvider: 'openai-compatible', transcriptionSource: 'local' })), ['openai-model'])
   assert.equal(setupState({ aiProvider: 'openai-compatible', transcriptionSource: 'local', openaiCompatibleUrl: 'http://localhost:11434/v1', openaiCompatibleModel: 'llama3.1' }).ready, true)
   // A Whisper server needs its URL; the built-in one needs nothing.
   assert.deepEqual(ids(setupState({ openrouterConfigured: true, transcriptionSource: 'local', localWhisperMode: 'server' })), ['whisper-url'])
@@ -393,32 +394,96 @@ test('first run: a Gemini user can finish setup from the card, and sees why Open
   assert.doesNotMatch(stuck, /Add your OpenRouter \(for cloud transcription\) key/)
   // Choosing local transcription completes setup; the card is gone.
   assert.equal(card({ aiProvider: 'gemini', geminiConfigured: true, transcriptionSource: 'local' }), '')
-  // The same for a custom endpoint: its fields are on the card until URL and model are set.
+  // The same for a custom endpoint: the card asks for a saved model until one is chosen.
   const custom = card({ aiProvider: 'openai-compatible', transcriptionSource: 'local' })
-  assert.match(custom, /Endpoint URL/)
-  assert.match(custom, /Model name/)
-  assert.match(custom, /API key \(optional\)/)
-  assert.equal(card({ aiProvider: 'openai-compatible', transcriptionSource: 'local', openaiCompatibleUrl: 'http://localhost:11434/v1', openaiCompatibleModel: 'llama3.1' }), '')
+  assert.match(custom, /Add model/)
+  assert.match(custom, /Add a model above: its endpoint URL, model name and, if the server needs one, an API key/)
+  assert.equal(card({ aiProvider: 'openai-compatible', transcriptionSource: 'local', ...chosenModel() }), '')
   // A Whisper server asks for its URL on the card.
   assert.match(card({ openrouterConfigured: true, transcriptionSource: 'local', localWhisperMode: 'server' }), /Whisper server URL/)
   // An OpenRouter user with a key sees nothing.
   assert.equal(card({ openrouterConfigured: true }), '')
 })
 
-test('the provider choice is a radio group with one tab stop and the chosen provider checked', () => {
-  for (const [aiProvider, label] of [['openrouter', 'OpenRouter'], ['gemini', 'Google Gemini'], ['openai-compatible', 'OpenAI-compatible']]) {
+/** A saved model card that is chosen, with the endpoint fields main fills from it. */
+function chosenModel(patch = {}) {
+  const preset = { id: 'card-1', name: '', url: 'http://localhost:11434/v1', model: 'llama3.1', vision: 'off', timeout: '30', keySaved: false, ...patch }
+  return {
+    modelPresets: [preset, { id: 'card-2', name: 'Groq', url: 'https://api.groq.com/openai/v1', model: 'openai/gpt-oss-120b', vision: 'off', timeout: '5', keySaved: true }],
+    activeModelPreset: preset.id, openaiCompatibleUrl: preset.url, openaiCompatibleModel: preset.model,
+    openaiCompatibleVision: preset.vision, openaiCompatibleTimeout: preset.timeout
+  }
+}
+
+test('the Claude plan is the first card, and needs no key', () => {
+  for (const compact of [false, true]) {
+    const html = withSettings({}, () => render(form.exports.ProviderPicker, { commit: async () => null, compact }))
+    const titles = [...html.matchAll(/<button[^>]*role="radio"[^>]*>.*?font-semibold[^>]*>([^<]+)</gs)].map((match) => match[1])
+    assert.deepEqual(titles, ['Claude plan', 'OpenRouter', 'Google Gemini'])
+    const needsKey = html.match(/Needs a key/g) ?? []
+    assert.equal(needsKey.length, 2, 'only OpenRouter and Gemini ask for a key')
+  }
+})
+
+test('the job form and the review say what Read images does on the Claude plan', () => {
+  const { JevSettings } = form.exports
+  const off = withSettings({ aiProvider: 'claude-plan', claudePlanVision: 'off', jevEnabled: 'on' }, () => render(JevSettings))
+  assert.match(off, /Read images is off for your Claude plan/)
+  assert.doesNotMatch(off, /custom model/)
+  const on = withSettings({ aiProvider: 'claude-plan', claudePlanVision: 'on', jevEnabled: 'on' }, () => render(JevSettings))
+  assert.match(on, /Read images is on for your Claude plan/)
+  const custom = withSettings({ aiProvider: 'openai-compatible', openaiCompatibleVision: 'on', jevEnabled: 'on' }, () => render(JevSettings))
+  assert.doesNotMatch(custom, /Claude plan/)
+})
+
+test('choosing the Claude plan offers its model, effort and image reading, and no key', () => {
+  const { ProviderFields, useApiKeyDrafts } = form.exports
+  const Fields = () => React.createElement(ProviderFields, { commit: async () => null, keys: useApiKeyDrafts() })
+  const html = withSettings({ aiProvider: 'claude-plan', claudePlanModel: 'opus', claudePlanEffort: 'high', claudePlanVision: 'on' }, () => render(Fields))
+  assert.match(html, />Model</)
+  assert.match(html, />Opus</)
+  assert.match(html, />Effort</)
+  assert.match(html, />High</)
+  assert.match(html, /The strongest picks/)
+  assert.match(html, /role="switch"[^>]*aria-checked="true"[^>]*aria-label="Read images with my Claude plan"/)
+  assert.match(html, /Test connection/)
+  assert.match(html, /Checking Claude Code/)
+  assert.match(html, /use this model in place of Jev/)
+  assert.doesNotMatch(html, /API key/)
+})
+
+test('the provider choice is one radio group of cards: one tab stop and exactly the chosen card ticked', () => {
+  const cases = [
+    ['openrouter', {}, 'OpenRouter'], ['gemini', {}, 'Google Gemini'], ['claude-plan', {}, 'Claude plan'],
+    ['openai-compatible', chosenModel(), 'llama3.1 · localhost:11434'],
+    ['openrouter', chosenModel(), 'OpenRouter']   // saved models stay listed, unticked
+  ]
+  for (const [aiProvider, patch, label] of cases) {
     for (const compact of [false, true]) {
-      const html = withSettings({ aiProvider }, () => render(form.exports.ProviderPicker, { commit: async () => null, compact }))
+      const html = withSettings({ aiProvider, ...patch }, () => render(form.exports.ProviderPicker, { commit: async () => null, compact }))
       assert.match(html, /role="radiogroup"[^>]*aria-label="AI provider"|aria-label="AI provider"[^>]*role="radiogroup"/)
       const radios = html.match(/<button[^>]*role="radio"[^>]*>/g) ?? []
-      assert.equal(radios.length, 3)
+      assert.equal(radios.length, 3 + (patch.modelPresets?.length ?? 0))
       assert.equal(radios.filter((radio) => radio.includes('aria-checked="true"')).length, 1)
       assert.equal(radios.filter((radio) => radio.includes('tabindex="0"')).length, 1)
       const checked = radios.find((radio) => radio.includes('aria-checked="true"'))
       assert.ok(checked.includes('tabindex="0"'), 'the checked radio is the tab stop')
       assert.match(html, new RegExp(label))
+      assert.match(html, /Add model/)
     }
   }
+  // Saved model cards: their name or model and host, badges, and edit and delete buttons outside the radio.
+  const html = withSettings({ aiProvider: 'openai-compatible', ...chosenModel() }, () => render(form.exports.ProviderPicker, { commit: async () => null }))
+  assert.match(html, />Groq</)
+  assert.match(html, /Key saved/)
+  assert.match(html, /aria-label="Edit Groq"/)
+  assert.match(html, /aria-label="Delete Groq"/)
+  assert.doesNotMatch(html, /role="radio"[^>]*>[^]*?aria-label="Edit Groq"[^]*?<\/button>\s*<\/button>/, 'no button inside a radio')
+  // A custom provider with no card chosen: nothing ticked, and the first card is still a tab stop.
+  const none = withSettings({ aiProvider: 'openai-compatible', ...chosenModel(), activeModelPreset: '' }, () => render(form.exports.ProviderPicker, { commit: async () => null }))
+  const radios = none.match(/<button[^>]*role="radio"[^>]*>/g) ?? []
+  assert.equal(radios.filter((radio) => radio.includes('aria-checked="true"')).length, 0)
+  assert.equal(radios.filter((radio) => radio.includes('tabindex="0"')).length, 1)
 })
 
 test('Review & edit is available with every provider', () => {
@@ -485,6 +550,19 @@ test('with another provider, the review settings say the chosen model answers th
   assert.match(gemini, /With Google Gemini, your own model answers the same checks instead/)
   assert.match(gemini, /less calibrated than Jev/)
   assert.equal(isDisabled(toggle(gemini)), false, 'the switch works with Gemini too')
+})
+
+test('a run on the Claude plan shows its picks as included, and any real charge as what it is', () => {
+  const { RunStats } = form.exports
+  const output = { total_clips: 2, clips: [{ virality_score: 0.8 }], source_video_duration_seconds: 600, processing_time_seconds: 90, created_at: null }
+  const planning = { provider: 'claude-plan', model: 'claude-sonnet-5-5', prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, estimated_cost_usd: 0, attempts: 1, cost_incomplete: true }
+  const included = render(RunStats, { output, costs: { total_estimated_cost_usd: 0, cost_incomplete: true, planning }, videoSpeed: 1 })
+  assert.match(included, /Included/)
+  assert.match(included, /In your Claude plan/)
+  assert.doesNotMatch(included, /Not tracked|\$0\.00/)
+  const withTranscription = render(RunStats, { output, costs: { total_estimated_cost_usd: 0.12, cost_incomplete: true, planning }, videoSpeed: 1 })
+  assert.match(withTranscription, /\$0\.12/)
+  assert.match(withTranscription, /Picks in your Claude plan/)
 })
 
 test('a run on Gemini or a custom endpoint with no reported price shows "Not tracked", not a small number', () => {
@@ -648,18 +726,35 @@ test('the Local Whisper models panel and device control appear only for built-in
   assert.doesNotMatch(html({ transcriptionSource: 'cloud' }), /Local Whisper models/)
 })
 
-test('a custom endpoint shows its wait time, and warns about Ollama\'s short default context only for Ollama', () => {
-  const { ProviderFields, useApiKeyDrafts } = form.exports
+test('a custom endpoint warns about Ollama\'s short default context only for Ollama; its card form holds the wait time', () => {
+  const { ProviderFields, ModelPresetForm, useApiKeyDrafts } = form.exports
   const Fields = () => React.createElement(ProviderFields, { commit: async () => null, keys: useApiKeyDrafts() })
-  const html = (patch) => withSettings({ aiProvider: 'openai-compatible', openaiCompatibleModel: 'llama3.1', ...patch }, () => render(Fields))
-  const ollama = html({ openaiCompatibleUrl: 'http://localhost:11434/v1' })
+  const html = (url) => withSettings({ aiProvider: 'openai-compatible', ...chosenModel({ url }) }, () => render(Fields))
+  const ollama = html('http://localhost:11434/v1')
   assert.match(ollama, /OLLAMA_CONTEXT_LENGTH=32768/)
-  assert.match(ollama, /Wait for a reply/)
-  assert.match(ollama, /30 minutes/, 'the default wait is shown')
-  assert.doesNotMatch(html({ openaiCompatibleUrl: 'http://localhost:1234/v1' }), /OLLAMA_CONTEXT_LENGTH/, 'LM Studio')
-  assert.doesNotMatch(html({ openaiCompatibleUrl: 'http://localhost:3001/v1' }), /OLLAMA_CONTEXT_LENGTH/)
-  assert.match(html({ openaiCompatibleUrl: 'http://localhost:3001/v1', openaiCompatibleTimeout: '60' }), /60 minutes/)
+  assert.match(ollama, /Clips are planned by/)
+  assert.match(ollama, /Test connection/)
+  assert.doesNotMatch(html('http://localhost:1234/v1'), /OLLAMA_CONTEXT_LENGTH/, 'LM Studio')
+  assert.doesNotMatch(html('http://localhost:3001/v1'), /OLLAMA_CONTEXT_LENGTH/)
+  // No card chosen: the fields ask for one instead of showing an endpoint form.
+  const none = withSettings({ aiProvider: 'openai-compatible', ...chosenModel(), activeModelPreset: '', openaiCompatibleUrl: '', openaiCompatibleModel: '' }, () => render(Fields))
+  assert.match(none, /Choose one of your saved models above/)
+  assert.doesNotMatch(none, /Endpoint URL/)
   assert.doesNotMatch(withSettings({ aiProvider: 'gemini' }, () => render(Fields)), /Wait for a reply/, 'Gemini has no wait setting')
+  // The add form: URL, model, optional key, images and the wait, with the default shown.
+  const add = withSettings({}, () => render(ModelPresetForm, { onClose() {} }))
+  for (const label of ['Endpoint URL', 'Model name', 'API key \\(optional\\)', 'This model can read images', 'Wait for a reply', '30 minutes', 'Save model']) {
+    assert.match(add, new RegExp(label))
+  }
+  assert.doesNotMatch(add, /Test connection/, 'a model is tested once saved')
+  // Editing a card shows its values and its own Test connection; its key is never on the page.
+  const preset = chosenModel({ url: 'http://localhost:11434/v1', timeout: '60', keySaved: true }).modelPresets[0]
+  const edit = withSettings({}, () => render(ModelPresetForm, { preset, onClose() {} }))
+  assert.match(edit, /60 minutes/)
+  assert.match(edit, /Saved securely\. Paste a new key to replace\./)
+  assert.match(edit, /OLLAMA_CONTEXT_LENGTH/)
+  assert.match(edit, /Test connection/)
+  assert.match(edit, /Save changes/)
 })
 
 test('Test connection shows one labelled line per check, with a word for each icon', () => {

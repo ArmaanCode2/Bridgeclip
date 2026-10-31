@@ -20,6 +20,7 @@ from typing import Any, Callable, Literal, Optional
 
 import httpx
 
+from clip_engine.error_policy import AI_PROVIDER_ERRORS
 from clip_engine.config import DURATION_RANGES, get_settings, is_longform, resolve_clip_duration_bounds
 from clip_engine.services import clip_judge, final_check, length_repair
 from clip_engine.services.editorial_evidence import parse_moment, overlaps
@@ -700,6 +701,8 @@ class IntelligencePlannerService:
         )
         if cannot_see_images:
             if not transcript:
+                if provider_of(self.settings) == 'claude-plan':
+                    raise AiClientError(AI_PROVIDER_ERRORS['images_off'], reason='images_off')
                 raise VisualPlanningUnsupportedError("Selected planner requires a video with speech")
             frames_to_send = []
         frame_images = await self._load_frames_as_base64(frames_to_send)

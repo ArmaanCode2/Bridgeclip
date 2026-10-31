@@ -37,6 +37,9 @@ test('provider setup: a Gemini user finishes from the Create page, and Settings 
   await app.evaluate(({ ipcMain }) => {
     ipcMain.removeHandler('system:checkTools')
     ipcMain.handle('system:checkTools', () => ({ python: true, pythonDeps: true, ffmpeg: true, ffmpegCaptions: true, ffprobe: true, ytdlp: true, engine: true, bridgeRunner: true }))
+    // Whether Claude Code is here depends on this machine too.
+    ipcMain.removeHandler('assistant:status')
+    ipcMain.handle('assistant:status', () => [{ id: 'claude', state: 'connected', version: '2.0.0', account: null, plan: 'max', detail: null, checkedAt: '' }])
   })
   await page.reload()
 
@@ -47,14 +50,24 @@ test('provider setup: a Gemini user finishes from the Create page, and Settings 
   assert.equal(await providers.getByRole('radio', { name: 'OpenRouter' }).getAttribute('aria-checked'), 'true')
   await shot('provider-setup-1-first-run.png')
 
-  await providers.getByRole('radio', { name: 'Google Gemini' }).click()
-  await card.getByLabel('Google Gemini API key').fill('AIzaE2eSecretKey')
-  // The key is saved as you type, but cloud transcription still needs OpenRouter, and the card says so.
-  await card.getByText('Cloud transcription uses OpenRouter', { exact: false }).waitFor()
-  await card.getByLabel('OpenRouter key for transcription').waitFor()
-  await shot('provider-setup-2-gemini-needs-transcription.png')
+  // The Claude plan needs no key, so it can finish setup on the spot. The card stays open until Done,
+  // and keyboard choosing keeps working: arrows move on from it to the next card.
+  await providers.getByRole('radio', { name: 'OpenRouter' }).focus()
+  await page.keyboard.press('ArrowLeft')
+  await card.getByText('Signed in · Max').waitFor()
+  await card.getByRole('button', { name: 'Done' }).waitFor()
+  assert.equal(saved().aiProvider, 'claude-plan')
+  assert.equal(saved().transcriptionSource, 'local')
+  await page.keyboard.press('ArrowRight')
+  await page.waitForFunction(() => document.querySelector('[role="radio"][aria-checked="true"]')?.textContent.includes('OpenRouter'))
+  assert.equal(saved().transcriptionSource, 'cloud')
 
-  await card.getByRole('button', { name: 'Use Local Whisper instead' }).click()
+  await providers.getByRole('radio', { name: 'Google Gemini' }).click()
+  // With no OpenRouter key, choosing Gemini moves speech to text to Local Whisper, and the card says so.
+  await card.getByText('Transcription now uses Local Whisper on this computer', { exact: false }).waitFor()
+  await shot('provider-setup-2-gemini-local-transcription.png')
+  // The key is saved as you type; with it, setup is complete and the card goes away.
+  await card.getByLabel('Google Gemini API key').fill('AIzaE2eSecretKey')
   await card.waitFor({ state: 'detached' })
   await page.getByRole('button', { name: 'Ready to clip' }).waitFor()
 
@@ -65,58 +78,120 @@ test('provider setup: a Gemini user finishes from the Create page, and Settings 
   assert.equal(fs.readFileSync(settingsFile, 'utf8').includes('AIzaE2eSecretKey'), false, 'the key must not be stored in plain text')
   assert.ok(afterSetup.geminiApiKey && afterSetup.geminiApiKey.scheme, 'the key is stored sealed')
 
-  // The wizard offers no Review & edit for Gemini, and says why.
+  // Review & edit runs on every provider: with Gemini, Gemini answers the review questions.
   const workflow = page.getByRole('radiogroup', { name: 'Workflow', exact: true })
-  assert.equal(await workflow.getByRole('radio', { name: 'Review & edit' }).isDisabled(), true)
+  assert.equal(await workflow.getByRole('radio', { name: 'Review & edit' }).isDisabled(), false)
   assert.equal(await workflow.getByRole('radio', { name: 'Automatic' }).isDisabled(), false)
-  await workflow.getByText('OpenRouter only').waitFor()
 
   // ── Settings ──────────────────────────────────────────────────────────────────
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+,' : 'Control+,')
   const picker = page.getByRole('radiogroup', { name: 'AI provider', exact: true })
   await picker.waitFor()
   assert.equal(await picker.getByRole('radio', { name: /Google Gemini/ }).getAttribute('aria-checked'), 'true')
-  await page.getByText('Jev runs on OpenRouter, so it is not used while Google Gemini picks your clips', { exact: false }).waitFor()
+  await page.getByText('Review & edit and the AI review of automatic clips use this model in place of Jev', { exact: false }).first().waitFor()
 
-  await picker.getByRole('radio', { name: /OpenAI-compatible/ }).click()
-  const url = page.getByLabel('Endpoint URL', { exact: true })
-  const model = page.getByLabel('Model name', { exact: true })
-
-  // An unsafe URL is explained under the field and is never saved.
+  // A custom endpoint is saved as a model card. An unsafe URL is explained in the form and never saved.
+  await page.getByRole('button', { name: 'Add model' }).click()
+  const adding = page.getByRole('group', { name: 'Add a model' })
+  const url = adding.getByLabel('Endpoint URL', { exact: true })
   await url.fill('http://example.com/v1')
-  await url.press('Tab')
-  await page.getByText('Use https:// for servers outside your own network.').waitFor()
-  assert.equal(saved().openaiCompatibleUrl, '')
+  await adding.getByLabel('Model name', { exact: true }).fill('llama3.1')
+  await adding.getByRole('button', { name: 'Save model' }).click()
+  await adding.getByText('Use https:// for servers outside your own network.').waitFor()
+  assert.deepEqual(saved().modelPresets ?? [], [])
   await url.fill('http://169.254.169.254/latest')
-  await url.press('Tab')
-  await page.getByText('That address is not allowed for a provider.').waitFor()
-  assert.equal(saved().openaiCompatibleUrl, '')
+  await adding.getByRole('button', { name: 'Save model' }).click()
+  await adding.getByText('That address is not allowed for a provider.').waitFor()
+  assert.deepEqual(saved().modelPresets ?? [], [])
 
-  // A good URL and model save, and Test connection reaches the server with no key when none is set.
+  // A good URL saves the card. Gemini works, so the new card waits to be clicked.
   await url.fill(`http://127.0.0.1:${mock.port}/v1`)
-  await url.press('Tab')
-  await model.fill('llama3.1')
-  await model.press('Tab')
-  await page.getByRole('button', { name: 'Test connection' }).click()
-  await page.getByText('Connected. 2 models available.').waitFor()
-  const call = mock.requests.find((entry) => entry.url === '/v1/models')
-  assert.ok(call, 'the server was asked for its models')
-  assert.equal(call.authorization, null)
-  assert.deepEqual(await page.locator('datalist option').evaluateAll((options) => options.map((option) => option.value)), ['qwen2.5:7b', 'llama3.1'])
+  await adding.getByRole('button', { name: 'Save model' }).click()
+  const custom = picker.getByRole('radio', { name: new RegExp(`llama3\\.1 · 127\\.0\\.0\\.1:${mock.port}`) })
+  await custom.waitFor()
+  // The form stays open on the new card, ready to test it; close it for now.
+  const justAdded = page.getByRole('group', { name: /^Edit / })
+  await justAdded.getByText('Saved as a card. Test it below, or close this.').waitFor()
+  await justAdded.getByRole('button', { name: 'Close' }).click()
+  await justAdded.waitFor({ state: 'detached' })
+  assert.equal(await custom.getAttribute('aria-checked'), 'false')
+  assert.equal(saved().modelPresets.length, 1)
+  assert.equal(saved().aiProvider, 'gemini')
+
+  // Clicking the card ticks it, and that model plans clips from now on.
+  await custom.click()
+  await page.waitForFunction(() => [...document.querySelectorAll('[role="radio"][aria-checked="true"]')].some((radio) => radio.textContent.includes('llama3.1')))
+  assert.equal(saved().aiProvider, 'openai-compatible')
+  assert.equal(saved().activeModelPreset, saved().modelPresets[0].id)
   assert.equal(saved().openaiCompatibleUrl, `http://127.0.0.1:${mock.port}/v1`)
   assert.equal(saved().openaiCompatibleModel, 'llama3.1')
 
-  await model.fill('missing-model')
-  await model.press('Tab')
+  // Test connection tests the chosen card's endpoint, with no key when none is set. This mock lists
+  // models but answers no chat request, so the model check fails with a plain reason.
   await page.getByRole('button', { name: 'Test connection' }).click()
-  // A model missing from the list is a spelling hint, not a failure: /models is not authoritative.
-  await page.getByText('Connected. Model "missing-model" is not in the server’s list, so check the spelling.').waitFor()
+  await page.getByText('The server answered and lists 2 models.').waitFor()
+  const call = mock.requests.find((entry) => entry.url === '/v1/models')
+  assert.ok(call, 'the server was asked for its models')
+  assert.equal(call.authorization, null)
+  assert.ok(mock.requests.some((entry) => entry.url === '/v1/chat/completions'), 'the saved model was asked to answer')
 
-  // The vision switch is saved, and read back after a reload.
-  await page.getByRole('switch', { name: 'This model can read images' }).click()
-  await page.waitForFunction(() => document.querySelector('[role="switch"][aria-label="This model can read images"]')?.getAttribute('aria-checked') === 'true')
+  // Editing the card: its own Test lists the server's models for the model field.
+  await page.getByRole('button', { name: /^Edit llama3\.1/ }).click()
+  const editing = page.getByRole('group', { name: /^Edit / })
+  await editing.getByRole('button', { name: 'Test connection' }).click()
+  await editing.getByText('The server answered and lists 2 models.').waitFor()
+  assert.deepEqual(await editing.locator('datalist option').evaluateAll((options) => options.map((option) => option.value)), ['qwen2.5:7b', 'llama3.1'])
+  await editing.getByLabel('Model name', { exact: true }).fill('missing-model')
+  await editing.getByRole('button', { name: 'Save changes' }).click()
+  await editing.waitFor({ state: 'detached' })
+  assert.equal(saved().openaiCompatibleModel, 'missing-model')
+  await page.getByRole('button', { name: 'Test connection' }).click()
+  await page.getByText('Model “missing-model” was not found. Pick one from the list.').first().waitFor()
+
+  // Image reading is part of the card, saved with it.
+  await page.getByRole('button', { name: /^Edit missing-model/ }).click()
+  await page.getByRole('group', { name: /^Edit / }).getByRole('switch', { name: 'This model can read images' }).click()
+  await page.getByRole('group', { name: /^Edit / }).getByRole('button', { name: 'Save changes' }).click()
+  await page.getByText('Reads images').waitFor()
+  assert.equal(saved().modelPresets[0].vision, 'on')
   assert.equal(saved().openaiCompatibleVision, 'on')
   await shot('provider-setup-3-settings-openai-compatible.png')
+
+  // ── Claude plan ───────────────────────────────────────────────────────────────
+  // The first card. It needs no key: choosing it offers the model, effort and image reading.
+  const claudePlan = picker.getByRole('radio').first()
+  assert.match(await claudePlan.textContent(), /Claude plan/)
+  await claudePlan.click()
+  await page.getByText('Signed in · Max').waitFor()
+  assert.equal(saved().aiProvider, 'claude-plan')
+  assert.equal(await page.getByRole('switch', { name: 'Read images with my Claude plan' }).getAttribute('aria-checked'), 'false')
+  await page.getByLabel('Model', { exact: true }).click()
+  await page.getByRole('option', { name: 'Opus' }).click()
+  await page.getByText('The strongest picks. Uses your plan the fastest.').waitFor()
+  await page.getByLabel('Effort', { exact: true }).click()
+  await page.getByRole('option', { name: 'Extra high' }).click()
+  await page.getByRole('switch', { name: 'Read images with my Claude plan' }).click()
+  await page.waitForFunction(() => document.querySelector('[role="switch"][aria-label="Read images with my Claude plan"]')?.getAttribute('aria-checked') === 'true')
+  await page.evaluate(() => window.bridgeclip.settings.load())
+  await shot('provider-setup-5-claude-plan.png')
+  assert.equal(saved().claudePlanModel, 'opus')
+  assert.equal(saved().claudePlanEffort, 'xhigh')
+  assert.equal(saved().claudePlanVision, 'on')
+
+  // The sign-in line follows Claude Code: Check again finds a sign-out, and a failed check says so.
+  await app.evaluate(({ ipcMain }) => {
+    ipcMain.removeHandler('assistant:status')
+    ipcMain.handle('assistant:status', () => [{ id: 'claude', state: 'signed-out', version: '2.0.0', account: null, plan: null, detail: null, checkedAt: '' }])
+  })
+  await page.locator('div', { hasText: 'Clips are picked by Claude Code' }).last().getByRole('button', { name: 'Check again' }).click()
+  await page.getByText('Claude Code is not signed in.', { exact: false }).waitFor()
+  await app.evaluate(({ ipcMain }) => {
+    ipcMain.removeHandler('assistant:status')
+    ipcMain.handle('assistant:status', () => { throw new Error('no answer') })
+  })
+  await picker.getByRole('radio', { name: /Google Gemini/ }).click()
+  await picker.getByRole('radio').first().click()
+  await page.getByText('Could not check Claude Code.').waitFor()
 
   // ── Local Whisper ─────────────────────────────────────────────────────────────
   const source = page.getByRole('radiogroup', { name: 'Transcription source', exact: true })

@@ -1,7 +1,7 @@
 import { useEffect, useState, type CSSProperties } from 'react'
 import { JEV_DEFAULTS, JEV_DOCS_URL, JEV_CONFIDENCE_URL, type JevThresholdKey } from '../../shared/jev-settings'
 import { useSettingsStore } from '../store/use-settings-store'
-import { AI_PROVIDER_LABELS } from '../../shared/providers'
+import { AI_PROVIDER_LABELS, providerReadsImages } from '../../shared/providers'
 import { getApi } from '../lib/ipc'
 import { errorMessage } from '../lib/utils'
 import './jev-settings.css'
@@ -35,8 +35,9 @@ export function JevSettings(): React.JSX.Element {
   // Jev is an OpenRouter service. With another provider, the same checks are answered by that provider's model.
   const otherProvider = settings.aiProvider !== 'openrouter'
   const providerLabel = AI_PROVIDER_LABELS[settings.aiProvider]
-  // Visual evidence needs a model that reads images; a custom endpoint says so with its own switch.
-  const noImages = settings.aiProvider === 'openai-compatible' && settings.openaiCompatibleVision !== 'on'
+  // Visual evidence needs a model that reads images; a custom endpoint or the Claude plan says so with its own switch.
+  const noImages = !providerReadsImages(settings)
+  const onClaudePlan = settings.aiProvider === 'claude-plan'
   const dirty = controls.some(({ key }) => Number(draft[key]) !== Number(toPercent(settings[key])) || draft[key] === '')
   const invalid = controls.some(({ key }) => !valid(draft[key]))
   const customized = controls.filter(({ key }) => Number(draft[key]) !== Number(defaults[key])).length
@@ -82,7 +83,7 @@ export function JevSettings(): React.JSX.Element {
       </fieldset>
       <div className="jev-actions"><button className="jev-reset" disabled={busy || !customized} onClick={() => { setDraft({ ...defaults }); setSaved(false); setError(null) }}>Restore defaults</button><div><span role="status" className="jev-save-state">{busy ? 'Saving…' : invalid ? 'Enter a value from 0 to 100.' : dirty ? 'Unapplied changes' : saved ? 'Saved' : 'Changes apply to new reviews'}</span><button className="jev-apply" disabled={busy || !dirty || invalid} onClick={apply}>Apply thresholds</button></div></div>
       <div className="jev-footnote"><p>These are minimum answer probabilities, not a guarantee of correctness or the confidence metric returned by Choice and Score. Existing review results keep the thresholds they used. Test changes on representative clips before relying on automation. Reaction protection and advisory checks retain their own safeguards. <button className="jev-learn" onClick={() => { void getApi().shell.openPath(JEV_CONFIDENCE_URL).catch(err => setError(errorMessage(err, 'Could not open the documentation'))) }}>Understanding probability &amp; confidence ↗</button></p></div>
-      <details className="jev-evidence"><summary>Visual evidence &amp; data use</summary><label><input type="checkbox" checked={settings.jevVisualContext === 'on'} disabled={busy || noImages} onChange={e => { void save({ jevVisualContext: e.target.checked ? 'on' : 'off' }) }} /><span>Use additional visual evidence for reaction context</span></label>{noImages && <p role="status">Your custom model is set as text-only, so no frames are sent. Turn on “This model can read images” in Settings → AI &amp; transcription to use visual evidence.</p>}<p>When text is insufficient, timestamped frames go to your vision model ({otherProvider ? `${providerLabel}, when it can read images` : 'OpenRouter'}): up to 8 requests per run and 12 frames per interval, which can add charges. Applies wherever the review runs, including Review &amp; edit.</p><p>{otherProvider ? `Your ${providerLabel} model` : 'Jev'} receives transcript excerpts, titles, and diagnostic text{otherProvider ? '' : ' through OpenRouter'}, with no video or audio. Unapproved cuts are restored.</p></details>
+      <details className="jev-evidence"><summary>Visual evidence &amp; data use</summary><label><input type="checkbox" checked={settings.jevVisualContext === 'on' || (onClaudePlan && !noImages)} disabled={busy || noImages || onClaudePlan} onChange={e => { void save({ jevVisualContext: e.target.checked ? 'on' : 'off' }) }} /><span>Use additional visual evidence for reaction context</span></label>{(noImages || onClaudePlan) && <p role="status">{!onClaudePlan ? 'Your custom model is set as text-only, so no frames are sent. Turn on “This model can read images” in Settings → AI & transcription to use visual evidence.' : noImages ? 'Read images is off for your Claude plan, so no frames are sent. Turn it on in Settings → AI & transcription to use visual evidence.' : 'Read images is on for your Claude plan, so the review can look at frames.'}</p>}<p>When text is insufficient, timestamped frames go to your vision model ({otherProvider ? `${providerLabel}, when it can read images` : 'OpenRouter'}): up to 8 requests per run and 12 frames per interval, which can add charges. Applies wherever the review runs, including Review &amp; edit.</p><p>{otherProvider ? `Your ${providerLabel} model` : 'Jev'} receives transcript excerpts, titles, and diagnostic text{otherProvider ? '' : ' through OpenRouter'}, with no video or audio. Unapproved cuts are restored.</p></details>
       {error && <p className="jev-error" role="alert">{error}</p>}
     </div>
   </section>

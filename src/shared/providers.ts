@@ -1,3 +1,5 @@
+import type { AssistantProviderStatus } from './assistant'
+
 /**
  * AI provider and transcription choices, shared by the main process (gates,
  * settings validation) and the renderer (setup flow, Settings page) so both
@@ -7,8 +9,40 @@
  * hidden default for a URL or a custom model name.
  */
 
-export const AI_PROVIDERS = ['openrouter', 'gemini', 'openai-compatible'] as const
+export const AI_PROVIDERS = ['openrouter', 'gemini', 'openai-compatible', 'claude-plan'] as const
 export type AiProvider = (typeof AI_PROVIDERS)[number]
+
+/**
+ * Models offered on the Claude plan. Aliases always mean the latest model. Fable is left out: in a
+ * background run Claude Code can charge usage credits for it without asking.
+ */
+export const CLAUDE_PLAN_MODELS = ['haiku', 'sonnet', 'opus'] as const
+export type ClaudePlanModel = (typeof CLAUDE_PLAN_MODELS)[number]
+export const DEFAULT_CLAUDE_PLAN_MODEL: ClaudePlanModel = 'sonnet'
+export const CLAUDE_PLAN_MODEL_LABELS: Record<ClaudePlanModel, string> = { haiku: 'Haiku', sonnet: 'Sonnet', opus: 'Opus' }
+export const CLAUDE_PLAN_MODEL_HINTS: Record<ClaudePlanModel, string> = {
+  haiku: 'Fastest, and the lightest on your plan.',
+  sonnet: 'Good for most videos.',
+  opus: 'The strongest picks. Uses your plan the fastest.'
+}
+export const CLAUDE_PLAN_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+export type ClaudePlanEffort = (typeof CLAUDE_PLAN_EFFORTS)[number]
+export const DEFAULT_CLAUDE_PLAN_EFFORT: ClaudePlanEffort = 'medium'
+export const CLAUDE_PLAN_EFFORT_LABELS: Record<ClaudePlanEffort, string> = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max' }
+
+/**
+ * Why Claude Code cannot use the plan right now, or null. Only a sign-in that reports a plan passes:
+ * anything else, such as an API key or a cloud account, would be billed rather than use the plan
+ * the person chose.
+ */
+export function claudePlanBlock(status: Pick<AssistantProviderStatus, 'state' | 'plan'>): string | null {
+  const fix = 'Or pick another AI provider in Settings → AI & transcription.'
+  if (status.state === 'not-installed') return `Claude Code is not installed on this computer. Install it and sign in with your Claude plan. ${fix}`
+  if (status.state === 'signed-out') return `Claude Code is not signed in. Open a terminal, run claude and sign in with your Claude plan. ${fix}`
+  if (status.state === 'unknown') return `Claude Code did not report how it is signed in. Run claude update, then try again. ${fix}`
+  if (!status.plan) return `Claude Code is signed in with an API key or another account, so this would not use your Claude plan. Sign in with your plan. ${fix}`
+  return null
+}
 
 export const TRANSCRIPTION_SOURCES = ['cloud', 'local'] as const
 export type TranscriptionSource = (typeof TRANSCRIPTION_SOURCES)[number]
@@ -55,13 +89,27 @@ export interface ProviderTestResult {
 }
 
 /** Which provider, endpoint and model a Test connection result is about. */
-export function testSubject(provider: AiProvider, settings: { openaiCompatibleUrl: string; openaiCompatibleModel: string; geminiModel: string }): string {
+export function testSubject(provider: AiProvider, settings: {
+  openaiCompatibleUrl: string; openaiCompatibleModel: string; geminiModel: string
+  claudePlanModel?: string; claudePlanEffort?: string; claudePlanVision?: string
+}): string {
   if (provider === 'gemini') return `gemini|${(settings.geminiModel || DEFAULT_GEMINI_MODEL).trim()}`
+  if (provider === 'claude-plan') return `claude-plan|${settings.claudePlanModel}|${settings.claudePlanEffort}|${settings.claudePlanVision}`
   if (provider === 'openai-compatible') {
     const checked = checkEndpointUrl(settings.openaiCompatibleUrl)
     return `openai-compatible|${checked.ok ? checked.url : ''}|${settings.openaiCompatibleModel.trim()}`
   }
   return 'openrouter'
+}
+
+/**
+ * Whether the chosen provider is sent video frames: always OpenRouter and Gemini, and a custom
+ * endpoint or the Claude plan only when the person said so.
+ */
+export function providerReadsImages(settings: { aiProvider: AiProvider; openaiCompatibleVision: string; claudePlanVision: string }): boolean {
+  if (settings.aiProvider === 'openai-compatible') return settings.openaiCompatibleVision === 'on'
+  if (settings.aiProvider === 'claude-plan') return settings.claudePlanVision === 'on'
+  return true
 }
 
 /**
@@ -79,6 +127,52 @@ export function visionAdvice(provider: AiProvider, readsImages: boolean | null, 
 export const OPENAI_COMPATIBLE_TIMEOUTS = ['5', '10', '30', '60', '120'] as const
 export type OpenaiCompatibleTimeout = (typeof OPENAI_COMPATIBLE_TIMEOUTS)[number]
 export const DEFAULT_OPENAI_COMPATIBLE_TIMEOUT: OpenaiCompatibleTimeout = '30'
+
+/**
+ * A saved OpenAI-compatible model: a card in Settings → AI & transcription. Clicking a card makes
+ * it the model that plans clips. Its key stays in main (encrypted); the renderer sees `keySaved`.
+ */
+export interface ModelPreset {
+  id: string
+  /** What the card says; empty shows "model · host". */
+  name: string
+  url: string
+  model: string
+  /** 'on' when the model can read images, for smart framing. */
+  vision: 'on' | 'off'
+  timeout: OpenaiCompatibleTimeout
+}
+export interface PublicModelPreset extends ModelPreset {
+  keySaved: boolean
+}
+/** A saved model being created (no id) or edited. `apiKey`: a string sets it, '' removes it, null keeps it. */
+export interface ModelPresetInput {
+  id?: string
+  name: string
+  url: string
+  model: string
+  apiKey: string | null
+  vision: 'on' | 'off'
+  timeout: OpenaiCompatibleTimeout
+}
+export const MAX_MODEL_PRESETS = 20
+export const MAX_MODEL_PRESET_NAME = 60
+
+/** A card name as saved: single spaces, no control characters, at most MAX_MODEL_PRESET_NAME characters. */
+export function modelPresetName(value: string): string {
+  return Array.from(value, (c) => (c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127 ? ' ' : c)).join('')
+    .replace(/\s+/g, ' ').trim().slice(0, MAX_MODEL_PRESET_NAME)
+}
+
+/** What a card is called: its name, or "model · host" when it has none. */
+export function modelPresetLabel(preset: Pick<ModelPreset, 'name' | 'url' | 'model'>): string {
+  if (preset.name) return preset.name
+  try {
+    return `${preset.model} · ${new URL(preset.url).host}`
+  } catch {
+    return preset.model
+  }
+}
 
 /** An Ollama server: its default port 11434, or "ollama" in the host name. */
 export function looksLikeOllama(url: string): boolean {
@@ -110,7 +204,8 @@ export function aiProviderChange(
 export const AI_PROVIDER_LABELS: Record<AiProvider, string> = {
   openrouter: 'OpenRouter',
   gemini: 'Google Gemini',
-  'openai-compatible': 'OpenAI-compatible'
+  'openai-compatible': 'OpenAI-compatible',
+  'claude-plan': 'Claude plan'
 }
 
 export interface LocalWhisperModelInfo {
@@ -287,7 +382,7 @@ export interface ProviderSetupInput {
   localWhisperUrl: string
 }
 
-export type SetupGapId = 'openrouter-key' | 'gemini-key' | 'openai-url' | 'openai-model' | 'whisper-url'
+export type SetupGapId = 'openrouter-key' | 'gemini-key' | 'openai-model' | 'whisper-url'
 
 export interface SetupGap {
   id: SetupGapId
@@ -303,6 +398,8 @@ export interface SetupGap {
 export function aiReady(input: ProviderSetupInput): boolean {
   if (input.aiProvider === 'openrouter') return input.openrouterConfigured
   if (input.aiProvider === 'gemini') return input.geminiConfigured
+  // Claude Code signs in on its own. Whether it is installed and signed in is checked when a job starts.
+  if (input.aiProvider === 'claude-plan') return true
   return Boolean(input.openaiCompatibleUrl.trim() && input.openaiCompatibleModel.trim())
 }
 
@@ -326,8 +423,10 @@ export function setupGaps(input: ProviderSetupInput): SetupGap[] {
   } else if (input.aiProvider === 'gemini' && !input.geminiConfigured) {
     gaps.push({ id: 'gemini-key', label: 'Gemini key', message: 'Add your Google Gemini API key.' })
   } else if (input.aiProvider === 'openai-compatible') {
-    if (!input.openaiCompatibleUrl.trim()) gaps.push({ id: 'openai-url', label: 'endpoint URL', message: 'Enter the endpoint URL of your OpenAI-compatible server.' })
-    if (!input.openaiCompatibleModel.trim()) gaps.push({ id: 'openai-model', label: 'model name', message: 'Enter the model name your OpenAI-compatible server should use.' })
+    // The endpoint fields come from the saved model that is chosen; both are empty when none is.
+    if (!input.openaiCompatibleUrl.trim() || !input.openaiCompatibleModel.trim()) {
+      gaps.push({ id: 'openai-model', label: 'a model', message: 'Choose one of your saved models, or add one.' })
+    }
   }
   if (input.transcriptionSource === 'cloud') {
     // OpenRouter is already reported when it is also the AI provider.

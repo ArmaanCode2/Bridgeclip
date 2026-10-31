@@ -44,6 +44,7 @@ function ipcWithLibrary(library) {
     './job-manager': { initJobManager() {} },
     './job-start': {},
     './provider-checks': {},
+    './assistant/providers': {},
     './whisper-models': {},
     './whisper-setup': {},
     './logger': {},

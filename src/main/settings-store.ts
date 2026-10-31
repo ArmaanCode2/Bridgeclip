@@ -1,9 +1,10 @@
 import { JEV_DEFAULTS, JEV_FEATURE_DEFAULTS, type JevThresholdSettings } from '../shared/jev-settings'
 import {
-  AI_PROVIDERS, DEFAULT_GEMINI_MODEL, DEFAULT_LOCAL_WHISPER_MODEL, DEFAULT_OPENAI_COMPATIBLE_TIMEOUT, LOCAL_WHISPER_MODES,
-  OPENAI_COMPATIBLE_TIMEOUTS, TRANSCRIPTION_SOURCES,
-  checkEndpointUrl, checkLocalWhisperUrl, isBuiltinWhisperModel, isSafeModelName,
-  type AiProvider, type LocalWhisperMode, type OpenaiCompatibleTimeout, type TranscriptionSource
+  AI_PROVIDERS, CLAUDE_PLAN_EFFORTS, CLAUDE_PLAN_MODELS, DEFAULT_CLAUDE_PLAN_EFFORT, DEFAULT_CLAUDE_PLAN_MODEL, DEFAULT_GEMINI_MODEL,
+  DEFAULT_LOCAL_WHISPER_MODEL, DEFAULT_OPENAI_COMPATIBLE_TIMEOUT, LOCAL_WHISPER_MODES,
+  MAX_MODEL_PRESETS, OPENAI_COMPATIBLE_TIMEOUTS, TRANSCRIPTION_SOURCES,
+  aiProviderChange, aiReady, checkEndpointUrl, checkLocalWhisperUrl, isBuiltinWhisperModel, isSafeModelName, modelPresetName, providerReadsImages,
+  type AiProvider, type ClaudePlanEffort, type ClaudePlanModel, type LocalWhisperMode, type ModelPreset, type OpenaiCompatibleTimeout, type PublicModelPreset, type TranscriptionSource
 } from '../shared/providers'
 import { LOCAL_WHISPER_DEVICES, LOCAL_WHISPER_LANGUAGE_CODES, type LocalWhisperDevice, type LocalWhisperLanguage } from '../shared/whisper-models'
 import { DEFAULT_SCREEN_FRAMING, DEFAULT_WEBCAM_LOCATION, DEFAULT_WEBCAM_POSITION, SCREEN_FRAMINGS, WEBCAM_LOCATIONS, WEBCAM_POSITIONS, type ScreenFraming, type WebcamLocation, type WebcamPosition } from '../shared/framing'
@@ -28,6 +29,16 @@ export interface AppSettings extends JevThresholdSettings {
   aiProvider: AiProvider
   geminiApiKey: string
   geminiModel: string
+  /** Saved OpenAI-compatible models, shown as cards in Settings; at most MAX_MODEL_PRESETS. */
+  modelPresets: StoredModelPreset[]
+  /** The saved model that plans clips when the provider is OpenAI-compatible; '' when none is chosen. */
+  activeModelPreset: string
+  /**
+   * The chosen saved model's endpoint, URL, key, model, image reading and wait. Filled from
+   * `activeModelPreset` whenever settings are normalized (empty when none is chosen), so every
+   * reader (the engine, job checks, Test connection, titles and captions) keeps using these.
+   * Saving them directly changes nothing; edit the saved model instead.
+   */
   openaiCompatibleUrl: string
   openaiCompatibleApiKey: string
   openaiCompatibleModel: string
@@ -35,6 +46,11 @@ export interface AppSettings extends JevThresholdSettings {
   openaiCompatibleVision: string
   /** Minutes to wait for the OpenAI-compatible endpoint to answer one request. */
   openaiCompatibleTimeout: OpenaiCompatibleTimeout
+  /** The model and effort that plan clips on the person's Claude plan. */
+  claudePlanModel: ClaudePlanModel
+  claudePlanEffort: ClaudePlanEffort
+  /** 'on' sends video frames to the Claude plan. */
+  claudePlanVision: string
   /** Speech-to-text source: Cloud (OpenRouter) or Local Whisper. */
   transcriptionSource: TranscriptionSource
   /** Built-in runs Whisper inside the engine's Python; server calls an OpenAI-compatible /audio/transcriptions URL. */
@@ -68,12 +84,20 @@ export interface AppSettings extends JevThresholdSettings {
   customVocabulary: string
 }
 
+/** A saved model with its key, as main holds it. The key never leaves main. */
+export interface StoredModelPreset extends ModelPreset {
+  apiKey: string
+}
+
 export type ApiKeyName = 'openrouterApiKey' | 'zernioApiKey' | 'geminiApiKey' | 'openaiCompatibleApiKey'
-export type PublicSettings = Pick<AppSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'jevEnabled' | 'jevVisualContext' | 'sourceContextWebResearch' | 'aiProvider' | 'geminiModel' | 'openaiCompatibleUrl' | 'openaiCompatibleModel' | 'openaiCompatibleVision' | 'openaiCompatibleTimeout' | 'transcriptionSource' | 'localWhisperMode' | 'localWhisperUrl' | 'localWhisperModel' | 'localWhisperDevice' | 'localWhisperLanguage' | 'webcamPosition' | 'webcamLocation' | 'screenFraming' | 'videoEncoder' | 'clipJudge' | keyof JevThresholdSettings> & {
+export type PublicSettings = Pick<AppSettings, 'outputDirectory' | 'pythonPath' | 'customVocabulary' | 'jevEnabled' | 'jevVisualContext' | 'sourceContextWebResearch' | 'aiProvider' | 'claudePlanModel' | 'claudePlanEffort' | 'claudePlanVision' | 'geminiModel' | 'openaiCompatibleUrl' | 'openaiCompatibleModel' | 'openaiCompatibleVision' | 'openaiCompatibleTimeout' | 'transcriptionSource' | 'localWhisperMode' | 'localWhisperUrl' | 'localWhisperModel' | 'localWhisperDevice' | 'localWhisperLanguage' | 'webcamPosition' | 'webcamLocation' | 'screenFraming' | 'videoEncoder' | 'clipJudge' | keyof JevThresholdSettings> & {
   openrouterConfigured: boolean
   zernioConfigured: boolean
   geminiConfigured: boolean
   openaiCompatibleConfigured: boolean
+  /** Saved models without their keys. */
+  modelPresets: PublicModelPreset[]
+  activeModelPreset: string
 }
 
 const SECRET_KEYS = ['openrouterApiKey', 'zernioApiKey', 'geminiApiKey', 'openaiCompatibleApiKey'] as const
@@ -87,11 +111,16 @@ const DEFAULT_SETTINGS: AppSettings = {
   aiProvider: 'openrouter',
   geminiApiKey: '',
   geminiModel: DEFAULT_GEMINI_MODEL,
+  modelPresets: [],
+  activeModelPreset: '',
   openaiCompatibleUrl: '',
   openaiCompatibleApiKey: '',
   openaiCompatibleModel: '',
   openaiCompatibleVision: 'off',
   openaiCompatibleTimeout: DEFAULT_OPENAI_COMPATIBLE_TIMEOUT,
+  claudePlanModel: DEFAULT_CLAUDE_PLAN_MODEL,
+  claudePlanEffort: DEFAULT_CLAUDE_PLAN_EFFORT,
+  claudePlanVision: 'off',
   transcriptionSource: 'cloud',
   localWhisperMode: 'builtin',
   localWhisperUrl: '',
@@ -108,7 +137,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   customVocabulary: ''
 }
 
-const SETTINGS_VERSION = 12
+/** 14: the Claude plan's model, effort and image switch. 13: saved models (modelPresets); the endpoint fields are filled from the chosen one. */
+const SETTINGS_VERSION = 14
 /**
  * Versions 9-11 (pre-release builds of this feature) saved Jev review and web
  * research as on by default, and older versions drop the fields entirely, so a
@@ -119,6 +149,10 @@ const SWITCHES = ['off', 'on']
 
 type PersistedSecret = { scheme: 'safeStorage' | 'base64'; value: string } | ''
 
+interface PersistedModelPreset extends ModelPreset {
+  apiKey: PersistedSecret
+}
+
 interface PersistedSettings extends JevThresholdSettings {
   version: number
   openrouterApiKey: PersistedSecret
@@ -126,10 +160,16 @@ interface PersistedSettings extends JevThresholdSettings {
   aiProvider?: string
   geminiApiKey?: PersistedSecret
   geminiModel?: string
+  modelPresets?: PersistedModelPreset[]
+  activeModelPreset?: string
+  /** Still written (the chosen saved model), so an older BridgeClip keeps that one model. */
   openaiCompatibleUrl?: string
   openaiCompatibleApiKey?: PersistedSecret
   openaiCompatibleModel?: string
   openaiCompatibleVision?: string
+  claudePlanModel?: string
+  claudePlanEffort?: string
+  claudePlanVision?: string
   openaiCompatibleTimeout?: string
   transcriptionSource?: string
   localWhisperMode?: string
@@ -168,13 +208,6 @@ function oneOf<T extends string>(value: string | undefined, allowed: readonly T[
   return value as T
 }
 
-/** An endpoint URL from the renderer. Empty stays empty, meaning not configured. */
-function endpointUrl(value: string | undefined, label: string): string {
-  const checked = checkEndpointUrl(value ?? '')
-  if (!checked.ok) throw new Error(`${label}: ${checked.error}`)
-  return checked.url
-}
-
 /** The URL of a Whisper server, which must be on this computer or a private network. */
 function whisperServerUrl(value: string | undefined): string {
   const checked = checkLocalWhisperUrl(value ?? '')
@@ -201,11 +234,58 @@ function whisperModel(value: string | undefined, mode: LocalWhisperMode): string
   return trimmed
 }
 
+const MODEL_PRESET_ID = /^[A-Za-z0-9-]{1,64}$/
+/** The id a file's single pre-version-13 endpoint gets as its card; fixed, so it is stable if the file cannot be rewritten. */
+const MIGRATED_PRESET_ID = 'saved-endpoint'
+
+/** A valid saved model, or null. `apiKey` must already be decrypted. */
+function checkedModelPreset(raw: unknown): StoredModelPreset | null {
+  if (!raw || typeof raw !== 'object') return null
+  const p = raw as Record<string, unknown>
+  const text = (value: unknown, max = 8192): string | null =>
+    typeof value === 'string' && value.length <= max && !value.includes('\0') ? value : null
+  const id = text(p.id, 64)
+  const url = checkEndpointUrl(text(p.url) ?? '')
+  const model = (text(p.model, 400) ?? '').trim()
+  const vision = p.vision === 'on' || p.vision === 'off' ? p.vision : null
+  const timeout = OPENAI_COMPATIBLE_TIMEOUTS.find((minutes) => minutes === p.timeout)
+  if (!id || !MODEL_PRESET_ID.test(id) || !url.ok || !url.url || !model || !isSafeModelName(model) || !vision || !timeout) return null
+  return { id, name: modelPresetName(text(p.name, 400) ?? ''), url: url.url, model, apiKey: (text(p.apiKey) ?? '').trim(), vision, timeout }
+}
+
+function normalizeModelPresets(value: unknown): StoredModelPreset[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value) || value.length > MAX_MODEL_PRESETS) throw new Error('Invalid saved models')
+  const presets: StoredModelPreset[] = []
+  for (const raw of value) {
+    const preset = checkedModelPreset(raw)
+    if (!preset || presets.some((p) => p.id === preset.id)) throw new Error('Invalid saved model')
+    presets.push(preset)
+  }
+  return presets
+}
+
+/** The endpoint fields every reader uses, from the chosen saved model; empty when none is chosen. */
+function endpointFields(preset: StoredModelPreset | undefined): Pick<AppSettings,
+  'openaiCompatibleUrl' | 'openaiCompatibleApiKey' | 'openaiCompatibleModel' | 'openaiCompatibleVision' | 'openaiCompatibleTimeout'> {
+  return {
+    openaiCompatibleUrl: preset?.url ?? '',
+    openaiCompatibleApiKey: preset?.apiKey ?? '',
+    openaiCompatibleModel: preset?.model ?? '',
+    openaiCompatibleVision: preset?.vision ?? 'off',
+    openaiCompatibleTimeout: preset?.timeout ?? DEFAULT_OPENAI_COMPATIBLE_TIMEOUT
+  }
+}
+
 function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
   if (!settings || typeof settings !== 'object') throw new Error('Invalid settings')
   for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof AppSettings)[]) {
-    if (settings[key] !== undefined && (typeof settings[key] !== 'string' || settings[key]!.length > 8192 || settings[key]!.includes('\0'))) throw new Error(`Invalid ${key}`)
+    if (key === 'modelPresets') continue
+    const value = settings[key] as unknown
+    if (value !== undefined && (typeof value !== 'string' || value.length > 8192 || value.includes('\0'))) throw new Error(`Invalid ${key}`)
   }
+  const modelPresets = normalizeModelPresets(settings.modelPresets)
+  const activePreset = modelPresets.find((preset) => preset.id === settings.activeModelPreset)
   const localWhisperMode = oneOf(settings.localWhisperMode, LOCAL_WHISPER_MODES, DEFAULT_SETTINGS.localWhisperMode, 'Whisper mode')
   const normalized: AppSettings = {
     jevThreshold: settings.jevThreshold ?? JEV_DEFAULTS.jevThreshold,
@@ -221,11 +301,12 @@ function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
     aiProvider: oneOf(settings.aiProvider, AI_PROVIDERS, DEFAULT_SETTINGS.aiProvider, 'AI provider'),
     geminiApiKey: (settings.geminiApiKey ?? DEFAULT_SETTINGS.geminiApiKey).trim(),
     geminiModel: modelName(settings.geminiModel, DEFAULT_GEMINI_MODEL, 'Gemini model'),
-    openaiCompatibleUrl: endpointUrl(settings.openaiCompatibleUrl, 'Endpoint URL'),
-    openaiCompatibleApiKey: (settings.openaiCompatibleApiKey ?? DEFAULT_SETTINGS.openaiCompatibleApiKey).trim(),
-    openaiCompatibleModel: modelName(settings.openaiCompatibleModel, '', 'Model name'),
-    openaiCompatibleVision: settings.openaiCompatibleVision ?? DEFAULT_SETTINGS.openaiCompatibleVision,
-    openaiCompatibleTimeout: oneOf(settings.openaiCompatibleTimeout, OPENAI_COMPATIBLE_TIMEOUTS, DEFAULT_SETTINGS.openaiCompatibleTimeout, 'endpoint wait time'),
+    modelPresets,
+    activeModelPreset: activePreset?.id ?? '',
+    ...endpointFields(activePreset),
+    claudePlanModel: oneOf(settings.claudePlanModel, CLAUDE_PLAN_MODELS, DEFAULT_SETTINGS.claudePlanModel, 'Claude plan model'),
+    claudePlanEffort: oneOf(settings.claudePlanEffort, CLAUDE_PLAN_EFFORTS, DEFAULT_SETTINGS.claudePlanEffort, 'Claude plan effort'),
+    claudePlanVision: settings.claudePlanVision ?? DEFAULT_SETTINGS.claudePlanVision,
     transcriptionSource: oneOf(settings.transcriptionSource, TRANSCRIPTION_SOURCES, DEFAULT_SETTINGS.transcriptionSource, 'transcription source'),
     localWhisperMode,
     localWhisperUrl: whisperServerUrl(settings.localWhisperUrl),
@@ -255,6 +336,7 @@ function normalizeSettings(settings: Partial<AppSettings>): AppSettings {
   if (!SWITCHES.includes(normalized.jevVisualContext)) throw new Error('Invalid visual context setting')
   if (!SWITCHES.includes(normalized.sourceContextWebResearch)) throw new Error('Invalid source research setting')
   if (!SWITCHES.includes(normalized.openaiCompatibleVision)) throw new Error('Invalid image analysis setting')
+  if (!SWITCHES.includes(normalized.claudePlanVision)) throw new Error('Invalid Claude plan image reading setting')
   if (!SWITCHES.includes(normalized.clipJudge)) throw new Error('Invalid second opinion setting')
   if (!isAbsolute(normalized.outputDirectory)) throw new Error('Settings folders must be absolute paths')
   return normalized
@@ -297,6 +379,7 @@ function savedJevSettings(raw: Record<string, unknown>): Pick<AppSettings, keyof
  */
 function savedProviderSettings(raw: Record<string, unknown>): Pick<AppSettings,
   'aiProvider' | 'geminiModel' | 'openaiCompatibleUrl' | 'openaiCompatibleModel' | 'openaiCompatibleVision' | 'openaiCompatibleTimeout' |
+  'claudePlanModel' | 'claudePlanEffort' | 'claudePlanVision' |
   'transcriptionSource' | 'localWhisperMode' | 'localWhisperUrl' | 'localWhisperModel' | 'localWhisperDevice' | 'localWhisperLanguage'> {
   const legacy = !Object.hasOwn(raw, 'localWhisperMode')
   const text = (value: unknown): string => typeof value === 'string' ? value.trim() : ''
@@ -341,6 +424,9 @@ function savedProviderSettings(raw: Record<string, unknown>): Pick<AppSettings,
     openaiCompatibleModel: modelOrEmpty(openaiCompatibleModel),
     openaiCompatibleVision: typeof raw.openaiCompatibleVision === 'string' && SWITCHES.includes(raw.openaiCompatibleVision) ? raw.openaiCompatibleVision : DEFAULT_SETTINGS.openaiCompatibleVision,
     openaiCompatibleTimeout: pick(raw.openaiCompatibleTimeout, OPENAI_COMPATIBLE_TIMEOUTS, DEFAULT_SETTINGS.openaiCompatibleTimeout),
+    claudePlanModel: pick(raw.claudePlanModel, CLAUDE_PLAN_MODELS, DEFAULT_SETTINGS.claudePlanModel),
+    claudePlanEffort: pick(raw.claudePlanEffort, CLAUDE_PLAN_EFFORTS, DEFAULT_SETTINGS.claudePlanEffort),
+    claudePlanVision: pick(raw.claudePlanVision, SWITCHES, DEFAULT_SETTINGS.claudePlanVision),
     transcriptionSource,
     localWhisperMode,
     localWhisperUrl: whisperUrlOrEmpty(localWhisperUrl),
@@ -349,6 +435,43 @@ function savedProviderSettings(raw: Record<string, unknown>): Pick<AppSettings,
     localWhisperDevice: pick(raw.localWhisperDevice, LOCAL_WHISPER_DEVICES, DEFAULT_SETTINGS.localWhisperDevice),
     localWhisperLanguage: pick(raw.localWhisperLanguage, LOCAL_WHISPER_LANGUAGE_CODES, DEFAULT_SETTINGS.localWhisperLanguage)
   }
+}
+
+/**
+ * Saved models, read leniently: one damaged entry is dropped instead of making the file (and
+ * every key in it) unreadable. A key that cannot be decrypted still fails the load, as for other
+ * keys. A file from before saved models existed turns its one endpoint into the first card, chosen.
+ */
+function savedModelPresets(raw: Record<string, unknown>, endpoint: Pick<AppSettings,
+  'openaiCompatibleUrl' | 'openaiCompatibleModel' | 'openaiCompatibleVision' | 'openaiCompatibleTimeout'>, endpointKey: string
+): { modelPresets: StoredModelPreset[]; activeModelPreset: string; rewrite: boolean } {
+  if (Array.isArray(raw.modelPresets)) {
+    const modelPresets: StoredModelPreset[] = []
+    let rewrite = false
+    for (const entry of raw.modelPresets.slice(0, MAX_MODEL_PRESETS)) {
+      const fields = entry && typeof entry === 'object' ? entry as Record<string, unknown> : {}
+      const key = decodeSecret(fields.apiKey)
+      if (key.legacy) rewrite = true
+      const preset = checkedModelPreset({
+        ...fields,
+        apiKey: key.value,
+        vision: fields.vision === 'on' ? 'on' : 'off',
+        timeout: OPENAI_COMPATIBLE_TIMEOUTS.find((minutes) => minutes === fields.timeout) ?? DEFAULT_OPENAI_COMPATIBLE_TIMEOUT
+      })
+      if (preset && !modelPresets.some((p) => p.id === preset.id)) modelPresets.push(preset)
+      else rewrite = true
+    }
+    const active = typeof raw.activeModelPreset === 'string' && modelPresets.some((p) => p.id === raw.activeModelPreset)
+      ? raw.activeModelPreset : ''
+    return { modelPresets, activeModelPreset: active, rewrite: rewrite || raw.modelPresets.length > MAX_MODEL_PRESETS }
+  }
+  const preset = checkedModelPreset({
+    id: MIGRATED_PRESET_ID, name: '', url: endpoint.openaiCompatibleUrl, model: endpoint.openaiCompatibleModel,
+    apiKey: endpointKey, vision: endpoint.openaiCompatibleVision, timeout: endpoint.openaiCompatibleTimeout
+  })
+  return preset
+    ? { modelPresets: [preset], activeModelPreset: preset.id, rewrite: true }
+    : { modelPresets: [], activeModelPreset: '', rewrite: false }
 }
 
 /** Saved framing and encoder choices. Files from before these settings existed load the defaults. */
@@ -376,6 +499,9 @@ function encodeSecret(value: string): PersistedSecret {
   throw new Error('Secure key storage is unavailable. Unlock or configure your operating system keychain before saving API keys.')
 }
 
+/** Decrypted keys by their saved ciphertext; main holds every loaded key in memory anyway. */
+const decrypted = new Map<string, string>()
+
 /**
  * Decodes a stored secret. Accepts the current `{scheme, value}` shape and the
  * plain base64 strings written by versions <= 0.1.16. `legacy` reports whether
@@ -397,7 +523,13 @@ function decodeSecret(value: unknown): { value: string; legacy: boolean } {
     try {
       if (obj.scheme === 'safeStorage') {
         if (!canEncrypt()) throw new Error('Secure key storage is unavailable')
-        return { value: safeStorage.decryptString(Buffer.from(obj.value, 'base64')), legacy: false }
+        // Settings load on every IPC call and media request; decrypt each saved key once.
+        const known = decrypted.get(obj.value)
+        if (known !== undefined) return { value: known, legacy: false }
+        const value = safeStorage.decryptString(Buffer.from(obj.value, 'base64'))
+        if (decrypted.size >= 64) decrypted.clear()
+        decrypted.set(obj.value, value)
+        return { value, legacy: false }
       }
       if (obj.scheme === 'base64') {
         if (!canEncrypt()) throw new Error('Secure key storage is unavailable')
@@ -424,10 +556,15 @@ export function loadSettings(): AppSettings {
       if (decoded.legacy) needsMigration = true
     }
 
+    const provider = savedProviderSettings(raw)
+    const presets = savedModelPresets(raw, provider, secrets.openaiCompatibleApiKey)
+    if (presets.rewrite) needsMigration = true
     const settings = normalizeSettings({
       ...secrets,
       ...savedJevSettings(raw),
-      ...savedProviderSettings(raw),
+      ...provider,
+      modelPresets: presets.modelPresets,
+      activeModelPreset: presets.activeModelPreset,
       ...savedFramingSettings(raw),
       // Files saved before this setting existed have none, and so load as on.
       clipJudge: typeof raw.clipJudge === 'string' && SWITCHES.includes(raw.clipJudge) ? raw.clipJudge : DEFAULT_SETTINGS.clipJudge,
@@ -462,11 +599,19 @@ function writeSettings(settings: AppSettings): void {
     aiProvider: settings.aiProvider,
     geminiApiKey: encodeSecret(settings.geminiApiKey),
     geminiModel: settings.geminiModel,
+    modelPresets: settings.modelPresets.map((preset) => ({
+      id: preset.id, name: preset.name, url: preset.url, model: preset.model,
+      apiKey: encodeSecret(preset.apiKey), vision: preset.vision, timeout: preset.timeout
+    })),
+    activeModelPreset: settings.activeModelPreset,
     openaiCompatibleUrl: settings.openaiCompatibleUrl,
     openaiCompatibleApiKey: encodeSecret(settings.openaiCompatibleApiKey),
     openaiCompatibleModel: settings.openaiCompatibleModel,
     openaiCompatibleVision: settings.openaiCompatibleVision,
     openaiCompatibleTimeout: settings.openaiCompatibleTimeout,
+    claudePlanModel: settings.claudePlanModel,
+    claudePlanEffort: settings.claudePlanEffort,
+    claudePlanVision: settings.claudePlanVision,
     transcriptionSource: settings.transcriptionSource,
     localWhisperMode: settings.localWhisperMode,
     localWhisperUrl: settings.localWhisperUrl,
@@ -523,12 +668,17 @@ export function publicSettings(settings: AppSettings): PublicSettings {
     zernioConfigured: Boolean(settings.zernioApiKey),
     geminiConfigured: Boolean(settings.geminiApiKey),
     openaiCompatibleConfigured: Boolean(settings.openaiCompatibleApiKey),
+    modelPresets: settings.modelPresets.map(({ apiKey, ...preset }) => ({ ...preset, keySaved: Boolean(apiKey) })),
+    activeModelPreset: settings.activeModelPreset,
     aiProvider: settings.aiProvider,
     geminiModel: settings.geminiModel,
     openaiCompatibleUrl: settings.openaiCompatibleUrl,
     openaiCompatibleModel: settings.openaiCompatibleModel,
     openaiCompatibleVision: settings.openaiCompatibleVision,
     openaiCompatibleTimeout: settings.openaiCompatibleTimeout,
+    claudePlanModel: settings.claudePlanModel,
+    claudePlanEffort: settings.claudePlanEffort,
+    claudePlanVision: settings.claudePlanVision,
     transcriptionSource: settings.transcriptionSource,
     localWhisperMode: settings.localWhisperMode,
     localWhisperUrl: settings.localWhisperUrl,
@@ -546,8 +696,20 @@ export function publicSettings(settings: AppSettings): PublicSettings {
   }
 }
 
+/**
+ * Saves what the renderer sends. The endpoint fields and the saved-model list in `update` are
+ * ignored: every save carries the renderer's copy of them, which can be older than a card
+ * edited a moment ago. Cards change through saveModelPreset and deleteModelPreset; choosing one
+ * is `activeModelPreset`.
+ */
 export function savePublicSettings(update: Partial<PublicSettings>): PublicSettings {
   const current = loadSettings()
+  // Anything but a string leaves the choice as it is; an id that is gone is refused, since it was clicked.
+  const choice = typeof update.activeModelPreset === 'string' ? update.activeModelPreset : undefined
+  if (choice !== undefined && choice !== current.activeModelPreset && choice !== '' &&
+      !current.modelPresets.some((preset) => preset.id === choice)) {
+    throw new Error('That saved model no longer exists. Reopen Settings and choose another.')
+  }
   return publicSettings(saveSettings({
     ...current,
     jevThreshold: update.jevThreshold ?? current.jevThreshold,
@@ -562,10 +724,10 @@ export function savePublicSettings(update: Partial<PublicSettings>): PublicSetti
     customVocabulary: update.customVocabulary ?? current.customVocabulary,
     aiProvider: update.aiProvider ?? current.aiProvider,
     geminiModel: update.geminiModel ?? current.geminiModel,
-    openaiCompatibleUrl: update.openaiCompatibleUrl ?? current.openaiCompatibleUrl,
-    openaiCompatibleModel: update.openaiCompatibleModel ?? current.openaiCompatibleModel,
-    openaiCompatibleVision: update.openaiCompatibleVision ?? current.openaiCompatibleVision,
-    openaiCompatibleTimeout: update.openaiCompatibleTimeout ?? current.openaiCompatibleTimeout,
+    activeModelPreset: choice ?? current.activeModelPreset,
+    claudePlanModel: update.claudePlanModel ?? current.claudePlanModel,
+    claudePlanEffort: update.claudePlanEffort ?? current.claudePlanEffort,
+    claudePlanVision: update.claudePlanVision ?? current.claudePlanVision,
     transcriptionSource: update.transcriptionSource ?? current.transcriptionSource,
     localWhisperMode: update.localWhisperMode ?? current.localWhisperMode,
     localWhisperUrl: update.localWhisperUrl ?? current.localWhisperUrl,
@@ -606,7 +768,84 @@ export function vocabularyTerms(value: string): string[] {
 export function replaceApiKey(key: ApiKeyName, value: string): PublicSettings {
   if (!SECRET_KEYS.includes(key) || typeof value !== 'string' || value.length > 8192 || value.includes('\0')) throw new Error('Invalid API key update')
   const current = loadSettings()
+  if (key === 'openaiCompatibleApiKey') {
+    // The endpoint key belongs to the chosen saved model.
+    if (!current.activeModelPreset) throw new Error('Choose one of your saved models first.')
+    return publicSettings(saveSettings({
+      ...current,
+      modelPresets: current.modelPresets.map((preset) => preset.id === current.activeModelPreset ? { ...preset, apiKey: value.trim() } : preset)
+    }))
+  }
   return publicSettings(saveSettings({ ...current, [key]: value.trim() }))
+}
+
+/**
+ * Creates a saved model (no `id`) or edits one. A key string replaces the saved key, '' removes
+ * it and null keeps it. A new model is chosen right away when nothing usable is chosen yet (a
+ * first run), switching speech to text to Local Whisper as choosing it by hand would.
+ */
+export function saveModelPreset(input: unknown): PublicSettings {
+  if (!input || typeof input !== 'object') throw new Error('Invalid saved model')
+  const v = input as Record<string, unknown>
+  const current = loadSettings()
+  const existing = v.id === undefined ? undefined : current.modelPresets.find((preset) => preset.id === v.id)
+  if (v.id !== undefined && !existing) throw new Error('That saved model no longer exists. Reopen Settings and try again.')
+  if (!existing && current.modelPresets.length >= MAX_MODEL_PRESETS) {
+    throw new Error(`You can save up to ${MAX_MODEL_PRESETS} models. Delete one you no longer use first.`)
+  }
+  const url = checkEndpointUrl(typeof v.url === 'string' ? v.url : '')
+  if (!url.ok) throw new Error(`Endpoint URL: ${url.error}`)
+  if (!url.url) throw new Error('Enter the endpoint URL.')
+  const model = typeof v.model === 'string' ? v.model.trim() : ''
+  if (!model) throw new Error('Enter the model name.')
+  if (!isSafeModelName(model)) throw new Error('Model name can only contain letters, numbers and . _ : / @ + -')
+  if (v.vision !== 'on' && v.vision !== 'off') throw new Error('Invalid image reading setting')
+  const timeout = OPENAI_COMPATIBLE_TIMEOUTS.find((minutes) => minutes === v.timeout)
+  if (!timeout) throw new Error('Invalid wait time')
+  if (v.name !== undefined && (typeof v.name !== 'string' || v.name.length > 400)) throw new Error('Invalid name')
+  // A key belongs to a server: moving the card to another one does not take the old key along.
+  const sameServer = existing !== undefined && new URL(existing.url).origin === new URL(url.url).origin
+  let apiKey = sameServer ? existing.apiKey : ''
+  if (v.apiKey !== null && v.apiKey !== undefined) {
+    if (typeof v.apiKey !== 'string' || v.apiKey.length > 8192 || v.apiKey.includes('\0')) throw new Error('Invalid API key')
+    apiKey = v.apiKey.trim()
+  }
+  const preset: StoredModelPreset = {
+    id: existing?.id ?? randomUUID(), name: modelPresetName(typeof v.name === 'string' ? v.name : ''),
+    url: url.url, model, apiKey, vision: v.vision, timeout
+  }
+  const modelPresets = existing
+    ? current.modelPresets.map((p) => p.id === preset.id ? preset : p)
+    : [...current.modelPresets, preset]
+  const usable = aiReady({
+    aiProvider: current.aiProvider, openrouterConfigured: Boolean(current.openrouterApiKey), geminiConfigured: Boolean(current.geminiApiKey),
+    openaiCompatibleUrl: current.openaiCompatibleUrl, openaiCompatibleModel: current.openaiCompatibleModel,
+    transcriptionSource: current.transcriptionSource, localWhisperMode: current.localWhisperMode, localWhisperUrl: current.localWhisperUrl
+  })
+  const choose = !existing && !usable
+    ? { activeModelPreset: preset.id, ...aiProviderChange('openai-compatible', { openrouterConfigured: Boolean(current.openrouterApiKey), transcriptionSource: current.transcriptionSource }) }
+    : {}
+  return publicSettings(saveSettings({ ...current, modelPresets, ...choose }))
+}
+
+/** Deletes a saved model. Deleting the chosen one leaves none chosen, so jobs ask for a choice. */
+export function deleteModelPreset(id: unknown): PublicSettings {
+  const current = loadSettings()
+  if (typeof id !== 'string' || !current.modelPresets.some((preset) => preset.id === id)) {
+    throw new Error('That saved model no longer exists.')
+  }
+  return publicSettings(saveSettings({
+    ...current,
+    modelPresets: current.modelPresets.filter((preset) => preset.id !== id),
+    activeModelPreset: current.activeModelPreset === id ? '' : current.activeModelPreset
+  }))
+}
+
+/** Settings as they would be with one saved model chosen, for testing that model's connection. */
+export function settingsWithModelPreset(settings: AppSettings, id: unknown): AppSettings {
+  const preset = settings.modelPresets.find((p) => p.id === id)
+  if (!preset) throw new Error('That saved model no longer exists.')
+  return { ...settings, ...endpointFields(preset) }
 }
 
 /**
@@ -630,6 +869,9 @@ export function getSettingsForBridge(settings: AppSettings): Record<string, stri
     OPENAI_COMPATIBLE_MODEL: settings.openaiCompatibleModel,
     OPENAI_COMPATIBLE_VISION: settings.openaiCompatibleVision === 'on' ? 'true' : 'false',
     OPENAI_COMPATIBLE_TIMEOUT_SECONDS: String(Number(settings.openaiCompatibleTimeout) * 60),
+    CLAUDE_PLAN_MODEL: settings.claudePlanModel,
+    CLAUDE_PLAN_EFFORT: settings.claudePlanEffort,
+    CLAUDE_PLAN_VISION: settings.claudePlanVision === 'on' ? 'true' : 'false',
     TRANSCRIPTION_SOURCE: settings.transcriptionSource,
     LOCAL_WHISPER_MODE: settings.localWhisperMode,
     LOCAL_WHISPER_URL: settings.transcriptionSource === 'local' && settings.localWhisperMode === 'server' ? settings.localWhisperUrl : '',
@@ -652,9 +894,8 @@ export function getSettingsForBridge(settings: AppSettings): Record<string, stri
     JEV_CUT_THRESHOLD: settings.jevCutThreshold,
     // The review runs on every provider: Jev on OpenRouter, the chosen model otherwise.
     JEV_ENABLED: settings.jevEnabled === 'on' ? 'true' : 'false',
-    // Frames go only to a model that can read them: always for OpenRouter and Gemini, and for a
-    // custom endpoint only when the person said it can.
-    JEV_VISUAL_CONTEXT: settings.jevVisualContext === 'on' && (settings.aiProvider !== 'openai-compatible' || settings.openaiCompatibleVision === 'on') ? 'true' : 'false',
+    // Frames go only to a model that can read them. On the Claude plan, Read images is the one switch for them.
+    JEV_VISUAL_CONTEXT: (settings.aiProvider === 'claude-plan' || settings.jevVisualContext === 'on') && providerReadsImages(settings) ? 'true' : 'false',
     LOCAL_MODE: 'true',
     LOCAL_OUTPUT_DIR: settings.outputDirectory
   }

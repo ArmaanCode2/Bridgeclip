@@ -23,9 +23,11 @@ test('a custom endpoint on localhost writes automation titles and captions with 
     let main = loadMain(ENTRY, { electron })
     main.settings.replaceApiKey('zernioApiKey', 'test-workspace')
     const library = path.join(dir, 'library'); fs.mkdirSync(library)
+    // The custom endpoint is a saved model card, chosen.
+    const card = main.settings.saveModelPreset({ name: '', url: `${mock.url}/v1`, model: 'qwen3', apiKey: null, vision: 'off', timeout: '30' })
     main.settings.savePublicSettings({
-      outputDirectory: library, pythonPath: 'python3', aiProvider: 'openai-compatible', openaiCompatibleUrl: `${mock.url}/v1`,
-      openaiCompatibleModel: 'qwen3', transcriptionSource: 'local', localWhisperMode: 'builtin'
+      outputDirectory: library, pythonPath: 'python3', aiProvider: 'openai-compatible', activeModelPreset: card.modelPresets[0].id,
+      transcriptionSource: 'local', localWhisperMode: 'builtin'
     })
     const clip = path.join(library, 'clip.mp4'); fs.writeFileSync(clip, 'clip bytes')
     const source = { title: 'Workshop', description: '', channel: '', url: null, videoId: 'c'.repeat(64) }

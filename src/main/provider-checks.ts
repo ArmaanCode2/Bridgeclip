@@ -10,6 +10,10 @@ import {
   type AiProvider, type ProviderCheck, type ProviderTestResult
 } from '../shared/providers'
 import type { AppSettings } from './settings-store'
+import { checkProvider } from './assistant/providers'
+import { askClaudePlan } from './claude-plan/chat'
+import { claudePlanBlock } from './job-gates'
+import type { AssistantProviderStatus } from '../shared/assistant'
 import type { LocalWhisperStatus } from '../shared/whisper-models'
 import { isModelDownloaded, type WhisperFs } from './whisper-models'
 
@@ -40,6 +44,8 @@ export interface ProviderCheckDeps {
   chatTimeoutMs?: number
   /** Picks the test image's colours. */
   random?: () => number
+  claudeStatus?: () => Promise<AssistantProviderStatus>
+  askClaudePlan?: typeof askClaudePlan
 }
 
 const TEST_TIMEOUT_MS = 10_000
@@ -148,6 +154,15 @@ export function twoColourPng(left: readonly number[], right: readonly number[], 
     pngChunk('IEND', Buffer.alloc(0))
   ])
   return `data:image/png;base64,${png.toString('base64')}`
+}
+
+const IMAGE_PROMPT = 'The image is split into a left half and a right half of different colours. Name each colour in one lowercase word.'
+
+/** Two different colours, so a model that cannot see the image cannot pass by guessing. */
+function testColours(random: () => number): [typeof TEST_COLOURS[number], typeof TEST_COLOURS[number]] {
+  const first = Math.floor(random() * TEST_COLOURS.length) % TEST_COLOURS.length
+  const second = (first + 1 + Math.floor(random() * (TEST_COLOURS.length - 1))) % TEST_COLOURS.length
+  return [TEST_COLOURS[first], TEST_COLOURS[second]]
 }
 
 // ---- Requests -------------------------------------------------------------------
@@ -344,12 +359,9 @@ async function testChatProvider(target: Target, subject: string, deps: ProviderC
     put({ id: 'images', state: 'skipped', message: 'Gemini models read images.' })
     return done()
   }
-  const random = deps.random ?? Math.random
-  const first = Math.floor(random() * TEST_COLOURS.length) % TEST_COLOURS.length
-  const second = (first + 1 + Math.floor(random() * (TEST_COLOURS.length - 1))) % TEST_COLOURS.length
-  const [left, right] = [TEST_COLOURS[first], TEST_COLOURS[second]]
+  const [left, right] = testColours(deps.random ?? Math.random)
   const { reply: seen } = await ask(worked, [
-    { type: 'text', text: 'The image is split into a left half and a right half of different colours. Name each colour in one lowercase word.' },
+    { type: 'text', text: IMAGE_PROMPT },
     { type: 'image_url', image_url: { url: twoColourPng(left.rgb, right.rgb) } }
   ], IMAGE_SCHEMA, 'image_test')
   if (seen.kind === 'reply' && seen.status === 200) {
@@ -390,6 +402,47 @@ async function testOpenRouter(key: string, deps: ProviderCheckDeps): Promise<Pro
   return { ok: false, message: problem?.message ?? 'The test did not finish.', models: [], checks, readsImages: null, subject }
 }
 
+/**
+ * Claude Code, its sign-in, then one small JSON question at low effort, so a test costs the plan
+ * little. With Read images on, also the two-colour picture a custom endpoint gets.
+ */
+async function testClaudePlan(settings: Pick<AppSettings, 'claudePlanModel' | 'claudePlanVision'>, subject: string, deps: ProviderCheckDeps): Promise<ProviderTestResult> {
+  const status = await (deps.claudeStatus ?? (() => checkProvider('claude')))()
+  if (status.state === 'not-installed') {
+    return finish([{ id: 'server', state: 'failed', message: 'Claude Code is not installed on this computer.' }], [], null, subject)
+  }
+  const checks: ProviderCheck[] = [{ id: 'server', state: 'ok', message: 'Claude Code is installed.' }]
+  const blocked = claudePlanBlock(status)
+  if (blocked) return finish([...checks, { id: 'key', state: 'failed', message: blocked }], [], null, subject)
+  checks.push({ id: 'key', state: 'ok', message: 'Signed in with your Claude plan.' })
+  const ask = deps.askClaudePlan ?? askClaudePlan
+  const question = { system: 'Answer by filling in the JSON schema.', model: settings.claudePlanModel, effort: 'low', timeoutMs: MAX_CHAT_TIMEOUT_MS }
+  const answer = await ask({ ...question, prompt: 'Set ok to true and word to "clip".', schema: JSON_SCHEMA })
+  if (!answer.ok) return finish([...checks, { id: 'model', state: 'failed', message: answer.message }], [], null, subject)
+  checks.push({ id: 'model', state: 'ok', message: 'The model answered.' })
+  const parsed = extractJson(answer.content) as { ok?: unknown } | undefined
+  checks.push(parsed?.ok === true
+    ? { id: 'json', state: 'ok', message: 'The model follows JSON instructions.' }
+    : { id: 'json', state: 'failed', message: 'The model did not answer with JSON. Try another model.' })
+  if (parsed?.ok !== true) return finish(checks, [], null, subject)
+  if (settings.claudePlanVision !== 'on') {
+    checks.push({ id: 'images', state: 'skipped', message: 'Read images is off.' })
+    return finish(checks, [], null, subject)
+  }
+  const [left, right] = testColours(deps.random ?? Math.random)
+  const seen = await ask({ ...question, prompt: IMAGE_PROMPT, image: twoColourPng(left.rgb, right.rgb), schema: IMAGE_SCHEMA })
+  // Read images is on, so a job would send frames: a model that cannot take them is not ready.
+  const noImages = (message: string, readsImages: boolean | null): ProviderTestResult => (
+    { ...finish([...checks, { id: 'images', state: 'failed', message }], [], readsImages, subject), ok: false, message }
+  )
+  if (!seen.ok) return noImages(seen.message, null)
+  const named = extractJson(seen.content) as { left?: unknown; right?: unknown } | undefined
+  const readsImages = typeof named?.left === 'string' && typeof named?.right === 'string' && left.words.test(named.left) && right.words.test(named.right)
+  if (!readsImages) return noImages('The model could not read the test image. Turn off Read images, or try another model.', false)
+  checks.push({ id: 'images', state: 'ok', message: 'The model read the test image.' })
+  return finish(checks, [], true, subject)
+}
+
 /** Runs Test connection for one provider, with its saved settings. */
 export async function testAiProvider(provider: unknown, settings: AppSettings, deps: ProviderCheckDeps = {}): Promise<ProviderTestResult> {
   if (typeof provider !== 'string' || !AI_PROVIDERS.includes(provider as AiProvider)) throw new Error('Unknown AI provider')
@@ -400,6 +453,7 @@ export async function testAiProvider(provider: unknown, settings: AppSettings, d
   if (provider === 'openrouter') {
     return settings.openrouterApiKey ? testOpenRouter(settings.openrouterApiKey, deps) : missing('Add your OpenRouter API key first.', 'key')
   }
+  if (provider === 'claude-plan') return testClaudePlan(settings, subject, deps)
   if (provider === 'gemini') {
     if (!settings.geminiApiKey) return missing(RESULT_MESSAGES.noGeminiKey, 'key')
     return testChatProvider({

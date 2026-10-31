@@ -10,7 +10,8 @@ import { logger } from './logger'
 import { assertMediaPath, isWebUrl } from './security'
 import { assertPublicWebUrl } from './network-policy'
 import { validateJobConfig } from './validation'
-import { gateJobStart, localWhisperBlock, whisperSetupBlock } from './job-gates'
+import { checkProvider } from './assistant/providers'
+import { claudePlanBlock, gateJobStart, localWhisperBlock, whisperSetupBlock } from './job-gates'
 import { whisperSetupState } from './whisper-setup'
 import { resolveAdvancedModels } from './openrouter-models'
 import { supportsCaptionFilter } from './tools'
@@ -56,6 +57,13 @@ export async function startClipJobRequest(request: unknown, options: { resumeTra
   }
   config.clippingMode = gate.clippingMode
   if (gate.layoutVision !== undefined) config.layoutVision = gate.layoutVision
+  if (settings.aiProvider === 'claude-plan') {
+    const blocked = claudePlanBlock(await checkProvider('claude'))
+    if (blocked) {
+      logger.warn('job.start.blocked', { reason: 'claude-plan' })
+      return { error: blocked }
+    }
+  }
 
   try {
     if (config.clippingMode === 'advanced') {

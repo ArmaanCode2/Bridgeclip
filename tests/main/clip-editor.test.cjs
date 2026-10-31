@@ -212,6 +212,35 @@ function setup(overrides = {}) {
   return { ...temp, run, library, main, reload: () => loadMain(source, mocks) }
 }
 
+test('a review on the Claude plan checks Claude Code first, and lists its runs in the run folder', async () => {
+  const { EventEmitter } = require('node:events')
+  const { PassThrough } = require('node:stream')
+  let status = { state: 'signed-out', plan: null }
+  let asked = null, finish, entered
+  const started = new Promise((resolve) => { entered = resolve })
+  const f = setup({
+    './claude-plan/runner': { claudePlanEnvironment: (provider, deps) => { asked = { provider, runFolder: deps.runFolder }; return {} } },
+    './assistant/providers': { checkProvider: async () => status },
+    child_process: { ...require('node:child_process'), spawn: () => {
+      const child = new EventEmitter()
+      child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough()
+      child.stdin.end = () => { entered(); finish = () => { child.stdout.write('{"ok":true}'); child.emit('close', 0) } }
+      return child
+    } }
+  })
+  try {
+    f.main.settings.savePublicSettings({ outputDirectory: f.library, pythonPath: 'python3', aiProvider: 'claude-plan', transcriptionSource: 'local' })
+    await assert.rejects(f.main.runEditor(f.run, 0, 'candidate-1', 'review'), /not signed in/)
+    assert.equal(asked, null, 'nothing started')
+    status = { state: 'connected', plan: 'max' }
+    const pending = f.main.runEditor(f.run, 0, 'candidate-1', 'review')
+    await started
+    assert.equal(asked.provider, 'claude-plan')
+    assert.equal(fs.realpathSync(asked.runFolder), fs.realpathSync(f.run))
+    finish(); await pending
+  } finally { f.cleanup() }
+})
+
 test('editor saves only editable fields, survives reload and refuses stale revisions', async () => {
   const f = setup()
   try {
@@ -803,10 +832,11 @@ test('the editor review runs on the chosen provider and is never handed a local 
   } } })
   try {
     f.main.settings.replaceApiKey('openrouterApiKey', 'fixture-key')
-    f.main.settings.replaceApiKey('openaiCompatibleApiKey', 'sk-custom-endpoint-key')
+    // The custom endpoint and its key are a saved model card, chosen.
+    const card = f.main.settings.saveModelPreset({ name: '', url: 'http://localhost:11434/v1', model: 'llama3.1', apiKey: 'sk-custom-endpoint-key', vision: 'off', timeout: '30' })
     f.main.settings.savePublicSettings({
       outputDirectory: f.library, pythonPath: 'python3',
-      aiProvider: 'openai-compatible', openaiCompatibleUrl: 'http://localhost:11434/v1', openaiCompatibleModel: 'llama3.1',
+      aiProvider: 'openai-compatible', activeModelPreset: card.modelPresets[0].id,
       transcriptionSource: 'local', localWhisperMode: 'server', localWhisperUrl: 'http://192.168.1.20:8000/v1', localWhisperDevice: 'gpu'
     })
     const pending = f.main.runEditor(f.run, 0, 'candidate-1', 'review')

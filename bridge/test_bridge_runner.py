@@ -363,10 +363,35 @@ class ProviderConfigurationTests(unittest.TestCase):
                   local_whisper_mode="server", local_whisper_url="http://127.0.0.1:8000/v1"), []),
             # OpenRouter planning with local transcription needs only the key.
             (dict(openrouter_api_key="k", transcription_source="local"), []),
+            # The Claude plan needs no key, only a way to start Claude Code.
+            (dict(ai_provider="claude-plan", claude_plan_runner='{"command": ["claude"]}', transcription_source="local"), []),
+            (dict(ai_provider="claude-plan", transcription_source="local"), ["CLAUDE_PLAN_RUNNER"]),
+            # Cloud transcription still runs on OpenRouter.
+            (dict(ai_provider="claude-plan", claude_plan_runner='{"command": ["claude"]}'), ["OPENROUTER_API_KEY"]),
         ]
         for values, expected in cases:
             with self.subTest(values=values):
                 self.assertEqual(bridge.missing_configuration(self.settings(**values)), expected)
+
+    def test_claude_plan_failures_say_what_to_do_next(self):
+        from clip_engine.error_policy import safe_failure_code, safe_processing_error
+        from clip_engine.services.ai_client import AiClientError
+        from clip_engine.services.claude_plan import _error
+
+        # From the error the provider raises to what the person reads, through the pipeline's own filter.
+        for reason, message, words in (("claude_auth", "not signed in", "sign in"), ("not_installed", "could not start", "installed"),
+                                       ("outdated", "too old", "claude update"), ("plan_limit", "usage limit", "after it resets"),
+                                       ("claude_model", "cannot use", "another model"), ("too_long", "too long", "larger model"),
+                                       ("claude_billing", "not using your Claude plan", "sign in with your plan"),
+                                       ("claude_timeout", "too long", "lower effort"), ("images_off", "no speech", "Read images")):
+            with self.subTest(reason=reason):
+                error = _error(reason, "words from Claude Code, with a secret")
+                self.assertIsInstance(error, AiClientError)
+                failure = bridge.describe_failure(safe_processing_error(error))
+                self.assertIn(message, failure["message"])
+                self.assertIn(words, failure["hint"])
+                self.assertEqual(safe_failure_code(error), f"planning.ai_{reason}")
+                self.assertNotIn("secret", json.dumps(failure))
 
     def test_local_whisper_failures_are_not_reported_as_openrouter_problems(self):
         for error in ("Local Whisper is not installed", "Local Whisper model could not be loaded",

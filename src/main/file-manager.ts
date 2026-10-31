@@ -7,7 +7,7 @@ import { constants, existsSync, lstatSync, mkdirSync, realpathSync, renameSync, 
 import { open, readdir } from 'fs/promises'
 import { isAbsolute, join, relative, sep } from 'path'
 import { resolveBinary } from './tools'
-import { parseJobOutput, type JobOutput } from '../shared/job-output'
+import { parseJobOutput, shownRunCost, type JobOutput } from '../shared/job-output'
 import { readRunRecord } from './run-history'
 
 export interface JobHistoryEntry {
@@ -95,7 +95,6 @@ export async function getJobHistory(baseDir: string, activeJobIds: ReadonlySet<s
         if (!result) throw new Error('Unsupported result file')
         const { data } = result
         const costs = data.metrics?.api_costs
-        const costVal = costs && typeof costs === 'object' ? (costs as Record<string, unknown>).total_estimated_cost_usd : null
         entries.push({
           favorite: isRunFavorite(join(baseDir, dir.name)),
           jobId: dir.name,
@@ -106,7 +105,7 @@ export async function getJobHistory(baseDir: string, activeJobIds: ReadonlySet<s
           candidateCount: data.editor_project && typeof data.metrics?.planned_clip_count === 'number' ? data.metrics.planned_clip_count : undefined,
           status: 'completed',
           outputDir: join(baseDir, dir.name),
-          totalCostUsd: typeof costVal === 'number' ? costVal : null,
+          totalCostUsd: shownRunCost(costs),
           finishedAt: record?.finishedAt ?? result.modified.toISOString(),
           durationMs: durationMs ?? (typeof data.processing_time_seconds === 'number' ? Math.round(data.processing_time_seconds * 1000) : null),
           errorMessage: null

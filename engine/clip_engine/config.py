@@ -597,9 +597,9 @@ class Settings(BaseSettings):
     jev_sponsor_threshold: float = Field(default=0.80, ge=0, le=1, allow_inf_nan=False)
     jev_evidence_threshold: float = Field(default=0.50, ge=0, le=1, allow_inf_nan=False)
     jev_cut_threshold: float = Field(default=0.95, ge=0, le=1, allow_inf_nan=False)
-    # Which service plans clips. Gemini and OpenAI-compatible endpoints are
-    # reached through clip_engine.services.ai_client.
-    ai_provider: Literal["openrouter", "gemini", "openai-compatible"] = "openrouter"
+    # Which service plans clips. Gemini, OpenAI-compatible endpoints and the
+    # Claude plan are reached through clip_engine.services.ai_client.
+    ai_provider: Literal["openrouter", "gemini", "openai-compatible", "claude-plan"] = "openrouter"
     gemini_api_key: Optional[str] = None
     gemini_model: str = "gemini-3.8-flash"
     openai_compatible_url: Optional[str] = None
@@ -610,6 +610,14 @@ class Settings(BaseSettings):
     # How long to wait for the OpenAI-compatible endpoint to answer one request,
     # for clip planning and frame checks alike. Local models can be slow.
     openai_compatible_timeout_seconds: float = 1800.0
+    # The person's Claude plan, reached through Claude Code on this computer. Aliases
+    # always mean the latest model. Fable is left out: in a background run Claude Code
+    # can charge usage credits for it without asking.
+    claude_plan_model: Literal["haiku", "sonnet", "opus"] = "sonnet"
+    claude_plan_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    claude_plan_vision: bool = False
+    # JSON from the main process: the command, environment and folder for a run.
+    claude_plan_runner: Optional[str] = None
     # Where speech is transcribed. "local" runs Whisper on this computer, either
     # inside the engine ("builtin") or on an OpenAI-compatible server.
     transcription_source: Literal["cloud", "local"] = "cloud"

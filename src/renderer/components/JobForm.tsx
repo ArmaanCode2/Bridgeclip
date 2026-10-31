@@ -17,7 +17,7 @@ import { SettingRow } from './ui/SettingRow'
 import { onRadioKeyDown } from './ui/Segmented'
 import { CLIP_REQUEST_MAX_CHARS, DURATION_OPTIONS, VIDEO_SPEED_OPTIONS } from '../../shared/job-contract'
 import { isModelId } from '../../shared/openrouter-models'
-import { AI_PROVIDER_LABELS, type AiProvider, type TranscriptionSource } from '../../shared/providers'
+import { AI_PROVIDER_LABELS, CLAUDE_PLAN_EFFORT_LABELS, CLAUDE_PLAN_MODEL_LABELS, providerReadsImages, type AiProvider, type TranscriptionSource } from '../../shared/providers'
 import { useModelStore } from '../store/use-model-store'
 import { useSettingsStore } from '../store/use-settings-store'
 import { ModelPicker } from './ModelPicker'
@@ -763,12 +763,16 @@ function useProviderView(): {
   const geminiModel = useSettingsStore((s) => s.geminiModel)
   const openaiCompatibleModel = useSettingsStore((s) => s.openaiCompatibleModel)
   const openaiCompatibleVision = useSettingsStore((s) => s.openaiCompatibleVision)
+  const claudePlanModel = useSettingsStore((s) => s.claudePlanModel)
+  const claudePlanEffort = useSettingsStore((s) => s.claudePlanEffort)
+  const claudePlanVision = useSettingsStore((s) => s.claudePlanVision)
   const transcriptionSource = useSettingsStore((s) => s.transcriptionSource)
   const localWhisperMode = useSettingsStore((s) => s.localWhisperMode)
   const localWhisperModel = useSettingsStore((s) => s.localWhisperModel)
 
-  const plannerModel = aiProvider === 'gemini' ? geminiModel : aiProvider === 'openai-compatible' ? (openaiCompatibleModel || 'No model set') : ''
-  const canSeeFrames = aiProvider !== 'openai-compatible' || openaiCompatibleVision === 'on'
+  const plannerModel = aiProvider === 'gemini' ? geminiModel : aiProvider === 'openai-compatible' ? (openaiCompatibleModel || 'No model set')
+    : aiProvider === 'claude-plan' ? `${CLAUDE_PLAN_MODEL_LABELS[claudePlanModel]} · ${CLAUDE_PLAN_EFFORT_LABELS[claudePlanEffort]} effort` : ''
+  const canSeeFrames = providerReadsImages({ aiProvider, openaiCompatibleVision, claudePlanVision })
   const transcriptionLabel = transcriptionSource === 'local'
     ? (localWhisperMode === 'server' ? 'Local Whisper server' : `Local Whisper · ${localWhisperModel}`)
     : 'Cloud transcription'
@@ -779,12 +783,15 @@ function useProviderView(): {
     ? 'Checks uncertain shots. May add OpenRouter charges.'
     : aiProvider === 'gemini'
       ? 'Checks uncertain shots with Gemini. Uses your Gemini quota.'
-      : canSeeFrames
+      : aiProvider === 'claude-plan'
+        ? canSeeFrames ? 'Checks uncertain shots with your Claude plan. Uses more of your plan.' : 'Read images is off for your Claude plan, so framing uses built-in face tracking. Turn it on in Settings to change that.'
+        : canSeeFrames
         ? 'Checks uncertain shots with your model. Uses its usage.'
         : 'Your model is set as text-only, so framing uses built-in face tracking. Turn on “This model can read images” in Settings to change that.'
   const planning = aiProvider === 'openrouter'
     ? `Clip planning${transcriptionSource === 'cloud' ? ' and transcription bill' : ' bills'} your OpenRouter account.`
-    : aiProvider === 'gemini' ? 'Clip planning uses your Gemini key.' : 'Clip planning uses your own endpoint.'
+    : aiProvider === 'gemini' ? 'Clip planning uses your Gemini key.'
+      : aiProvider === 'claude-plan' ? 'Clip planning uses your Claude plan.' : 'Clip planning uses your own endpoint.'
   const billingHint = `Runs on this computer. ${planning}${aiProvider === 'openrouter' && transcriptionSource === 'cloud' ? '' : ` ${transcriptionNote}`}`
   return {
     aiProvider, plannerModel, transcriptionSource, transcriptionLabel, transcriptionNote, canSeeFrames, visionHint, billingHint,

@@ -69,12 +69,16 @@ test('the endpoint wait time defaults to 30 minutes, saves a listed value and re
     assert.equal(t.store.loadSettings().openaiCompatibleTimeout, '30')
     assert.equal(t.store.publicSettings(t.store.loadSettings()).openaiCompatibleTimeout, '30')
     assert.equal(t.store.getSettingsForBridge(t.store.loadSettings()).OPENAI_COMPATIBLE_TIMEOUT_SECONDS, '1800')
-    const saved = t.store.savePublicSettings({ openaiCompatibleTimeout: '120' })
+    // The wait belongs to the saved model that is chosen.
+    const card = { name: '', url: 'http://localhost:11434/v1', model: 'llama3.1', apiKey: null, vision: 'off', timeout: '120' }
+    const id = t.store.saveModelPreset(card).modelPresets[0].id
+    const saved = t.store.savePublicSettings({ aiProvider: 'openai-compatible', activeModelPreset: id })
     assert.equal(saved.openaiCompatibleTimeout, '120')
     assert.equal(t.raw().openaiCompatibleTimeout, '120')
+    assert.equal(t.raw().modelPresets[0].timeout, '120')
     assert.equal(t.store.getSettingsForBridge(t.store.loadSettings()).OPENAI_COMPATIBLE_TIMEOUT_SECONDS, '7200')
     for (const value of ['0', '15', '999', 'forever', '']) {
-      assert.throws(() => t.store.savePublicSettings({ openaiCompatibleTimeout: value }), /wait time|Invalid/, JSON.stringify(value))
+      assert.throws(() => t.store.saveModelPreset({ ...card, id, timeout: value }), /wait time|Invalid/, JSON.stringify(value))
     }
     assert.equal(t.store.loadSettings().openaiCompatibleTimeout, '120')
   } finally { t.cleanup() }

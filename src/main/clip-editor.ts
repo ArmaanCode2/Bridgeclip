@@ -5,8 +5,10 @@ import { delimiter, dirname, join } from 'path'
 import { createHash, randomUUID } from 'crypto'
 import { EDITOR_REVISION_CONFLICT, editorFailureMessage, editorProgress, isEditorErrorCode, parseCandidateEdit, parseEditorProject, renderEditKey, type CandidateEdit, type EditorBatch, type EditorErrorCode, type EditorProgressSummary, type EditorProject, type EditorSession } from '../shared/clip-editor'
 import { loadSettings, getSettingsForBridge } from './settings-store'
+import { claudePlanEnvironment } from './claude-plan/runner'
+import { checkProvider } from './assistant/providers'
 import { AI_PROVIDER_LABELS, aiReady } from '../shared/providers'
-import { setupInputFromSettings } from './job-gates'
+import { claudePlanBlock, setupInputFromSettings } from './job-gates'
 import { assertAbsolutePath, assertMediaPath, isWithinDirectory, openAuthorizedMedia } from './security'
 import { getJobOutput } from './file-manager'
 import { getBridgeRunnerPath, getEnginePath, resolvePythonPath, runtimeEnvironment } from './pipeline-runner'
@@ -311,9 +313,13 @@ async function executeEditor(path: unknown, revision: unknown, candidateId: unkn
     if (action === 'review' && !aiReady(setupInputFromSettings(settings))) {
       throw new Error(`Reviewing a clip uses ${AI_PROVIDER_LABELS[settings.aiProvider]}. Finish setting it up in Settings → AI & transcription to run this review.`)
     }
+    if (action === 'review' && settings.aiProvider === 'claude-plan') {
+      const blocked = claudePlanBlock(await checkProvider('claude'))
+      if (blocked) throw new Error(blocked)
+    }
     // The review runs on the chosen provider: Jev on OpenRouter, that provider's model otherwise.
     // The editor transcribes nothing, so it is never handed a local Whisper server.
-    const env: Record<string, string | undefined> = { ...runtimeEnvironment(), ...getSettingsForBridge({ ...settings, jevEnabled: 'on' }), LOCAL_WHISPER_URL: '', PYTHONPATH: engine, PYTHONUNBUFFERED: '1', PYTHONDONTWRITEBYTECODE: '1' }
+    const env: Record<string, string | undefined> = { ...runtimeEnvironment(), ...getSettingsForBridge({ ...settings, jevEnabled: 'on' }), ...claudePlanEnvironment(settings.aiProvider, { runFolder: run }), LOCAL_WHISPER_URL: '', PYTHONPATH: engine, PYTHONUNBUFFERED: '1', PYTHONDONTWRITEBYTECODE: '1' }
     const ffmpeg = resolveBinary('ffmpeg')
     if (ffmpeg !== 'ffmpeg' && (ffmpeg.includes('/') || ffmpeg.includes('\\'))) {
       const binDir = dirname(ffmpeg)

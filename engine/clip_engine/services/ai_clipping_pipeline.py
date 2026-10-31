@@ -50,6 +50,7 @@ from clip_engine.services.rendering_service import (
     RenderResult,
     RenderingService,
 )
+from clip_engine.services.claude_plan import raise_if_stopped
 from clip_engine.services.s3_upload_service import (
     ClipArtifact,
     JobOutput,
@@ -194,6 +195,13 @@ class AIClippingPipeline:
         self._current_callback_url: Optional[str] = None
         self._current_external_job_id: Optional[str] = None
         self._current_owner_user_id: Optional[str] = None
+
+    def _review_costs(self, clip_plan: ClipPlanResponse, total: float) -> dict:
+        """The costs of a Review & edit run. The Claude plan's section lets Run stats say it was included."""
+        costs = {'total_estimated_cost_usd': total, 'cost_incomplete': True}
+        if provider_of(self.settings) == 'claude-plan' and clip_plan.api_costs:
+            costs['planning'] = asdict(clip_plan.api_costs)
+        return costs
 
     async def process_video(
         self,
@@ -436,6 +444,7 @@ class AIClippingPipeline:
             clip_plan = await self.intelligence_planner.plan_clips(**planning_args)
             edit_audit['planner'] = getattr(self.intelligence_planner, 'audit', {'requests': []})
             stage_timings["planning"] = time.perf_counter() - stage_start
+            raise_if_stopped()
             logger.info(f"Planned {len(clip_plan.segments)} clips")
             skipped_weak = getattr(clip_plan, 'skipped_weak', 0)
             if skipped_weak and clip_plan.segments:
@@ -473,7 +482,7 @@ class AIClippingPipeline:
                     total_clips=0, clips=[], editor_project=True, transcript_url=transcript_upload.s3_url,
                     processing_time_seconds=time.time() - start_time,
                     metrics={'planned_clip_count': len(project['candidates']),
-                        'api_costs': {'total_estimated_cost_usd': costs, 'cost_incomplete': True},
+                        'api_costs': self._review_costs(clip_plan, costs),
                         'diagnostics': self._diagnostics.snapshot(),
                         'pipeline_stages': self._stage_progress.update('completed')})
                 self._save_local_json(job_id, 'job_output', asdict(output))
@@ -560,6 +569,7 @@ class AIClippingPipeline:
                 save_edit_audit()
                 if not pending:
                     break
+            raise_if_stopped()
             clip_plan.segments = accepted
             clip_plan.total_clips = len(accepted)
             if not accepted:

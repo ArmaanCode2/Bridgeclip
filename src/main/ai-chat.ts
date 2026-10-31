@@ -1,6 +1,7 @@
 import {
-  AI_PROVIDER_LABELS, DEFAULT_GEMINI_MODEL, GEMINI_OPENAI_BASE_URL, checkEndpointUrl, isLocalEndpoint, type AiProvider
+  AI_PROVIDER_LABELS, DEFAULT_CLAUDE_PLAN_EFFORT, DEFAULT_GEMINI_MODEL, GEMINI_OPENAI_BASE_URL, checkEndpointUrl, isLocalEndpoint, type AiProvider
 } from '../shared/providers'
+import { askClaudePlan } from './claude-plan/chat'
 
 /**
  * Chat requests to Gemini and OpenAI-compatible endpoints from the main process, shaped the way
@@ -8,7 +9,7 @@ import {
  * strict schema, then JSON mode, then plain text when a server refuses, temperature 0.2 unless
  * the model refuses one, and the output allowance lowered or renamed when the server says so.
  * Replies are read the way the engine reads them. Test connection and metadata writing use this;
- * OpenRouter keeps its own request paths.
+ * OpenRouter keeps its own request paths, and the Claude plan answers through Claude Code.
  */
 
 type FetchLike = typeof fetch
@@ -207,7 +208,7 @@ export function responseFormat(level: number, name: string, schema: object): Rec
 export class ProviderError extends Error {}
 
 /** Messages from ProviderError start with one of these. */
-export const PROVIDER_MESSAGE_PREFIX = /^(OpenRouter|Google Gemini|Your AI endpoint)/
+export const PROVIDER_MESSAGE_PREFIX = /^(OpenRouter|Google Gemini|Your AI endpoint|Your Claude plan)/
 
 export interface ChatTarget {
   provider: Exclude<AiProvider, 'openrouter'>
@@ -220,11 +221,17 @@ export interface ChatTarget {
   timeoutMs: number
 }
 
-/** The saved Gemini or OpenAI-compatible model to ask, or null when it is OpenRouter or not set up. */
+/** The saved Gemini, OpenAI-compatible or Claude plan model to ask, or null when it is OpenRouter or not set up. */
 export function ownModelTarget(settings: {
   aiProvider: AiProvider; geminiApiKey: string; geminiModel: string; openaiCompatibleUrl: string; openaiCompatibleApiKey: string
-  openaiCompatibleModel: string; openaiCompatibleTimeout: string
+  openaiCompatibleModel: string; openaiCompatibleTimeout: string; claudePlanModel: string
 }, maxTimeoutMs = 600_000): ChatTarget | null {
+  if (settings.aiProvider === 'claude-plan') {
+    return {
+      provider: 'claude-plan', base: '', key: '', model: settings.claudePlanModel,
+      label: 'Your Claude plan', local: true, timeoutMs: Math.min(300_000, maxTimeoutMs)
+    }
+  }
   if (settings.aiProvider === 'gemini') {
     if (!settings.geminiApiKey) return null
     return {
@@ -251,7 +258,17 @@ export interface ChatMessage { role: 'system' | 'user' | 'assistant'; content: s
  */
 export async function chatJson(target: ChatTarget, request: {
   messages: ChatMessage[]; schema: object; schemaName: string; maxTokens: number; maxBytes?: number
-}, deps: { fetch?: FetchLike } = {}): Promise<unknown> {
+}, deps: { fetch?: FetchLike; askClaudePlan?: typeof askClaudePlan } = {}): Promise<unknown> {
+  if (target.provider === 'claude-plan') {
+    const joined = (wanted: boolean): string => request.messages.filter((message) => (message.role === 'system') === wanted).map((message) => message.content).join('\n\n')
+    // The effort chosen for picking clips would be wasted here, and could outlast the wait.
+    const answer = await (deps.askClaudePlan ?? askClaudePlan)({
+      system: joined(true), prompt: joined(false), schema: request.schema, model: target.model,
+      effort: DEFAULT_CLAUDE_PLAN_EFFORT, timeoutMs: target.timeoutMs
+    })
+    if (!answer.ok) throw new ProviderError(answer.message)
+    return extractJson(answer.content)
+  }
   const doFetch = deps.fetch ?? fetch
   const instruction = schemaInstruction(request.schema)
   const lastUser = request.messages.map((message) => message.role).lastIndexOf('user')

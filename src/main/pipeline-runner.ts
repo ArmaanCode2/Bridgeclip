@@ -9,6 +9,7 @@ const execFileAsync = promisify(execFile)
 import { createInterface } from 'readline'
 import { Transform } from 'stream'
 import { loadSettings, getSettingsForBridge, vocabularyTerms } from './settings-store'
+import { claudePlanEnvironment } from './claude-plan/runner'
 import { gateJobStart } from './job-gates'
 import { logger } from './logger'
 import { parseJobOutput, type JobOutput } from '../shared/job-output'
@@ -435,7 +436,13 @@ export function startClipJob(
     exitWithoutProcess()
     return
   }
-  const envVars = getSettingsForBridge({ ...settings, jevEnabled: config.workflow === 'review' ? 'on' : settings.jevEnabled })
+  const envVars: Record<string, string> = { ...getSettingsForBridge({ ...settings, jevEnabled: config.workflow === 'review' ? 'on' : settings.jevEnabled }), ...claudePlanEnvironment(settings.aiProvider, { runFolder: join(settings.outputDirectory, jobId) }) }
+  if (settings.aiProvider === 'claude-plan' && !envVars.CLAUDE_PLAN_RUNNER) {
+    logger.warn('job.start.blocked', { jobId, reason: 'claude-plan' })
+    reportError({ jobId, message: 'BridgeClip could not find Claude Code. Check that it is installed, or pick another AI provider in Settings → AI & transcription.' })
+    exitWithoutProcess()
+    return
+  }
   const enginePath = getEnginePath()
   const bridgePath = getBridgeRunnerPath()
   const pythonPath = resolvePythonPath(enginePath, settings.pythonPath)

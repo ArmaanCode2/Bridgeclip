@@ -12,6 +12,8 @@ const SHELL_PATH_TIMEOUT_MS = 3000
 const PATH_MARKER = '__BRIDGECLIP_PATH__'
 
 let shellPathPromise: Promise<string | null> | null = null
+/** The login-shell PATH once it has been read, for resolveCliNow. */
+let knownShellPath: string | null = null
 
 /** Read PATH from the user's login shell, between markers so noisy rc files can't corrupt it. */
 export function loginShellPath(): Promise<string | null> {
@@ -28,7 +30,8 @@ export function loginShellPath(): Promise<string | null> {
       windowsHide: true
     }, (_error, stdout) => {
       const match = String(stdout ?? '').match(new RegExp(`${PATH_MARKER}([^\\0]*?)${PATH_MARKER}`))
-      resolve(match && match[1].trim() ? match[1].trim() : null)
+      knownShellPath = match && match[1].trim() ? match[1].trim() : null
+      resolve(knownShellPath)
     })
   })
   return shellPathPromise
@@ -126,8 +129,7 @@ function resolveWindowsShim(shim: string, pathEntries: string[]): ResolvedCli | 
 }
 
 /** Find a CLI on the login-shell PATH, then the process PATH, then well-known folders. */
-export async function resolveCli(name: 'claude' | 'codex'): Promise<ResolvedCli | null> {
-  const shellPath = await loginShellPath()
+function findCli(name: 'claude' | 'codex', shellPath: string | null): ResolvedCli | null {
   const entries = uniquePath([
     ...(shellPath ?? '').split(delimiter),
     ...(process.env.PATH ?? '').split(delimiter),
@@ -151,6 +153,15 @@ export async function resolveCli(name: 'claude' | 'codex'): Promise<ResolvedCli 
     if (isExecutable(candidate)) return { command: candidate, prefixArgs: [], pathValue }
   }
   return null
+}
+
+export async function resolveCli(name: 'claude' | 'codex'): Promise<ResolvedCli | null> {
+  return findCli(name, await loginShellPath())
+}
+
+/** resolveCli for code that cannot wait: the login-shell PATH counts only once it has been read. */
+export function resolveCliNow(name: 'claude' | 'codex'): ResolvedCli | null {
+  return findCli(name, knownShellPath)
 }
 
 const INHERITED_ENV = [

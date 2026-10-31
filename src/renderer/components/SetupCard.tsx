@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { KeyRound, ShieldCheck, Wrench } from 'lucide-react'
 import { useSettingsStore, useSetupState } from '../store/use-settings-store'
 import { useApiKeyDrafts } from '../hooks/use-api-key-drafts'
@@ -14,6 +14,13 @@ import { IconTile } from './ui/IconTile'
  */
 export function SetupCard({ onOpenSettings, className }: { onOpenSettings: () => void; className?: string }): React.JSX.Element | null {
   const { gaps, toolsOk } = useSetupState()
+  const aiProvider = useSettingsStore((s) => s.aiProvider)
+  // The Claude plan needs no key, so choosing it can finish setup on the spot. The card stays open
+  // until Done, so its model, sign-in and the move to Local Whisper can be seen.
+  const shown = useRef(false)
+  const [done, setDone] = useState(false)
+  if (gaps.length > 0) shown.current = true
+  const reviewing = gaps.length === 0 && shown.current && aiProvider === 'claude-plan' && !done
   const toolStatus = useSettingsStore((s) => s.toolStatus)
   const toolError = useSettingsStore((s) => s.toolError)
   const save = useSettingsStore((s) => s.save)
@@ -40,7 +47,7 @@ export function SetupCard({ onOpenSettings, className }: { onOpenSettings: () =>
       ].filter(Boolean).join(', ')
     : ''
 
-  if (gaps.length > 0) {
+  if (gaps.length > 0 || reviewing) {
     return (
       <section
         className={cn(
@@ -78,6 +85,7 @@ export function SetupCard({ onOpenSettings, className }: { onOpenSettings: () =>
           <ShieldCheck className="h-3.5 w-3.5 text-success/80" />
           Keys are encrypted on this computer with your system keychain.
           <Button size="sm" variant="ghost" onClick={onOpenSettings} className="ml-auto">More options in Settings</Button>
+          {reviewing && <Button size="sm" variant="primary" onClick={() => setDone(true)}>Done</Button>}
         </p>
         {(keys.error || saveError) && <p role="alert" className="relative -mt-2 px-4 pb-4 text-xs text-danger">{keys.error ?? saveError}</p>}
       </section>

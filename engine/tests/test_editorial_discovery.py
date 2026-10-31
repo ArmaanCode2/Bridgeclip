@@ -134,6 +134,53 @@ def test_pipeline_rediscovery_is_bounded_and_preserves_approved_clips(monkeypatc
         assert output['metrics']['api_costs']['planning']['estimated_cost_usd'] == .02
 
 
+@pytest.mark.parametrize('stops_during', [1, 2], ids=['planning', 'the second search'])
+def test_a_plan_that_ran_out_in_a_step_that_can_be_skipped_fails_the_job_before_rendering(monkeypatch, tmp_path, stops_during):
+    from clip_engine.services import claude_plan
+    from clip_engine.services import ai_clipping_pipeline as module
+    from clip_engine.services.ai_clipping_pipeline import AIClippingPipeline, ClippingJobRequest, JobStatus
+    from clip_engine.services.rendering_service import RenderingService, RenderResult
+    from clip_engine.services.transcription_service import TranscriptionResult, TranscriptSegment
+    from tests.test_coherence_review import reviewer
+    settings = module.get_settings()
+    monkeypatch.setattr(settings, 'local_mode', True)
+    monkeypatch.setattr(settings, 'jev_enabled', True)  # Rediscovery only follows Jev review.
+    monkeypatch.setattr(settings, 'openrouter_api_key', 'fixture')
+    monkeypatch.setattr(settings, 'local_output_dir', str(tmp_path / 'out'))
+    monkeypatch.setattr(settings.__class__, 'temp_directory', property(lambda self: str(tmp_path / 'work')))
+    monkeypatch.setattr(RenderingService, '_verify_ffmpeg', lambda self: None)
+    pipeline = AIClippingPipeline()
+    gate, _ = reviewer(lambda state, q: 'Rejected' not in state['retained_dialogue'])
+    gate.segments = [TranscriptSegment(0, 11000, 'Approved original.'), TranscriptSegment(40000, 51000, 'Rejected excerpt.'), TranscriptSegment(100000, 111000, 'Approved overlooked idea.')]
+    gate.duration_ms = 360000
+    gate.repair = AsyncMock(return_value=None)
+    monkeypatch.setattr(module, 'CoherenceReviewer', lambda *args: gate)
+    monkeypatch.setattr(module, 'protect_acknowledgments', AsyncMock())
+    monkeypatch.setattr(module, 'review_duplicate_candidates', AsyncMock())
+    download = AsyncMock(return_value=SimpleNamespace(video_path=str(tmp_path / 'source.mp4'), file_size_bytes=1,
+        metadata=SimpleNamespace(title='Synthetic source', duration_seconds=360, width=1920, height=1080)))
+    transcribe = AsyncMock(return_value=TranscriptionResult(segments=gate.segments, full_text='Full source'))
+    calls = []
+    monkeypatch.setattr(claude_plan, '_stopped_by', None)
+    async def plan(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == stops_during:
+            # A judge or a search swallowed the failure, so only the remembered stop shows it.
+            claude_plan._stopped_by = 'plan_limit'
+        segments = [ClipPlanSegment(0, 11000, .9), ClipPlanSegment(40000, 51000, .8)]
+        return ClipPlanResponse(segments=segments, total_clips=2, api_costs=PlanningApiCosts(provider='fixture', model='fixture',
+            estimated_cost_usd=.01))
+    render = AsyncMock(return_value=None)
+    monkeypatch.setattr(pipeline.video_downloader, 'download_video', download)
+    monkeypatch.setattr(pipeline.transcription_service, 'transcribe', transcribe)
+    monkeypatch.setattr(pipeline.intelligence_planner, 'plan_clips', plan)
+    monkeypatch.setattr(pipeline.rendering_service, 'render_clip', render)
+    result = asyncio.run(pipeline.process_video(ClippingJobRequest(video_url='fixture.mp4', job_id='fixture', max_clips=2, auto_clip_count=False)))
+    assert result.status == JobStatus.FAILED
+    assert result.error == 'Your Claude plan reached its usage limit'
+    assert render.await_count == 0
+
+
 def test_failed_second_discovery_has_no_transport_retry(monkeypatch):
     from clip_engine.services.intelligence_planner import IntelligencePlanningError
     planner = make_planner()

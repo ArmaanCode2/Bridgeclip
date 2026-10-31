@@ -52,6 +52,7 @@ function startRunner({ child, env = process.env, onSpawn = () => {}, settings: s
     child_process: { execFile: require('node:child_process').execFile, spawn: (command, args, options) => { onSpawn(command, args, options); return child } },
     './settings-store': { loadSettings: () => settings, getSettingsForBridge: () => ({ OPENROUTER_API_KEY: SECRET, LOCAL_MODE: 'true', LOCAL_OUTPUT_DIR: WORK_HOME }), vocabularyTerms: () => [] },
     './job-gates': jobGates,
+    './claude-plan/runner': { claudePlanEnvironment: () => ({}) },
     './logger': { logger: { info() {}, error() {}, warn() {} } },
     '../shared/job-output': jobOutput,
     '../shared/run-diagnostics': loadShared('run-diagnostics.ts'),

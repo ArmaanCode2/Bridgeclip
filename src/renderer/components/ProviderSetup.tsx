@@ -1,18 +1,20 @@
 import { useEffect, useId, useState } from 'react'
-import { Check, CircleAlert, Loader2, Minus, PlugZap, X } from 'lucide-react'
+import { Check, CircleAlert, CircleCheck, Loader2, Minus, Pencil, PlugZap, Plus, Trash2, X } from 'lucide-react'
 import { useSettingsStore, whenSettingsSaved, type SettingsPatch } from '../store/use-settings-store'
 import type { useApiKeyDrafts } from '../hooks/use-api-key-drafts'
 import { getApi } from '../lib/ipc'
 import { cn, errorMessage } from '../lib/utils'
 import { PROVIDER_LINKS } from '../config/brand'
 import {
-  AI_PROVIDER_LABELS, DEFAULT_GEMINI_MODEL, GEMINI_MODEL_SUGGESTIONS, OPENAI_COMPATIBLE_TIMEOUTS, PROVIDER_CHECK_LABELS, aiProviderChange,
+  AI_PROVIDER_LABELS, DEFAULT_GEMINI_MODEL, DEFAULT_OPENAI_COMPATIBLE_TIMEOUT, GEMINI_MODEL_SUGGESTIONS, MAX_MODEL_PRESETS, MAX_MODEL_PRESET_NAME,
+  OPENAI_COMPATIBLE_TIMEOUTS, PROVIDER_CHECK_LABELS, aiProviderChange, modelPresetLabel,
   testSubject, visionAdvice,
   checkEndpointUrl, checkLocalWhisperUrl, isLocalEndpoint, isSafeModelName, localWhisperModeChange, looksLikeOllama,
   type AiProvider, type OpenaiCompatibleTimeout, type ProviderCheck, type TranscriptionSource
 } from '../../shared/providers'
-import type { LocalWhisperStatus, ProviderTestResult } from '../../preload/index'
+import type { LocalWhisperStatus, ProviderTestResult, PublicModelPreset } from '../../preload/index'
 import { ApiKeyInput } from './ApiKeyInput'
+import { ClaudePlanFields } from './ClaudePlanFields'
 import { WhisperModelsPanel } from './WhisperModelsPanel'
 import { LOCAL_WHISPER_LANGUAGES, type LocalWhisperLanguage } from '../../shared/whisper-models'
 import { Select } from './ui/Select'
@@ -20,7 +22,7 @@ import { Badge } from './ui/Badge'
 import { Button } from './ui/Button'
 import { Callout } from './ui/Callout'
 import { Field, TextInput } from './ui/Field'
-import { Segmented, onRadioKeyDown } from './ui/Segmented'
+import { Segmented } from './ui/Segmented'
 import { SettingRow } from './ui/SettingRow'
 import { Switch } from './ui/Switch'
 
@@ -32,16 +34,36 @@ export type CommitSettings = (patch: SettingsPatch) => Promise<string | null>
 
 type Keys = ReturnType<typeof useApiKeyDrafts>
 
-const PROVIDER_CHOICES: { id: AiProvider; title: string; description: string }[] = [
+const PROVIDER_CHOICES: { id: 'claude-plan' | 'openrouter' | 'gemini'; title: string; description: string }[] = [
+  { id: 'claude-plan', title: AI_PROVIDER_LABELS['claude-plan'], description: 'Picks clips with your own plan, through Claude Code on this computer. No key needed.' },
   { id: 'openrouter', title: AI_PROVIDER_LABELS.openrouter, description: 'One key for everything. Includes Jev review and automatic failover.' },
-  { id: 'gemini', title: AI_PROVIDER_LABELS.gemini, description: 'Your own Google AI Studio key. Picks clips and frames the shots.' },
-  { id: 'openai-compatible', title: AI_PROVIDER_LABELS['openai-compatible'], description: 'OpenAI, Ollama, LM Studio or any server with an OpenAI-style API.' }
+  { id: 'gemini', title: AI_PROVIDER_LABELS.gemini, description: 'Your own Google AI Studio key. Picks clips and frames the shots.' }
 ]
 
-function isConfigured(provider: AiProvider, s: { openrouterConfigured: boolean; geminiConfigured: boolean; openaiCompatibleUrl: string; openaiCompatibleModel: string }): boolean {
-  if (provider === 'openrouter') return s.openrouterConfigured
-  if (provider === 'gemini') return s.geminiConfigured
-  return Boolean(s.openaiCompatibleUrl.trim() && s.openaiCompatibleModel.trim())
+/**
+ * Arrow keys move between the cards of the group. Unlike onRadioKeyDown, the radios are not
+ * siblings: each saved model's radio shares its card with Edit and Delete buttons.
+ */
+function onCardKeyDown(event: React.KeyboardEvent<HTMLButtonElement>): void {
+  const radios = Array.from(
+    event.currentTarget.closest('[role="radiogroup"]')?.querySelectorAll<HTMLButtonElement>('[role="radio"]:not(:disabled)') ?? []
+  )
+  const current = radios.indexOf(event.currentTarget)
+  if (current < 0) return
+  let next = current
+  if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (current + 1) % radios.length
+  else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (current - 1 + radios.length) % radios.length
+  else if (event.key === 'Home') next = 0
+  else if (event.key === 'End') next = radios.length - 1
+  else return
+  event.preventDefault()
+  radios[next].focus()
+  radios[next].click()
+}
+
+/** The host and port of a saved model's endpoint, for its card. */
+function endpointHost(url: string): string {
+  try { return new URL(url).host } catch { return url }
 }
 
 /**
@@ -50,22 +72,39 @@ function isConfigured(provider: AiProvider, s: { openrouterConfigured: boolean; 
  */
 let transcriptionMovedByProvider = false
 
-/** Choose where clip selection runs. A radio group, so arrow keys move between the three. */
+/** The tick on the card in use. */
+function Chosen({ chosen }: { chosen: boolean }): React.JSX.Element | null {
+  return chosen
+    ? <CircleCheck aria-hidden className="h-4 w-4 shrink-0 text-accent" strokeWidth={2.5} />
+    : null
+}
+
+/**
+ * Who picks the clips: your Claude plan, OpenRouter, Gemini, or one of your saved models. One radio group of cards,
+ * so exactly one has the tick, and arrow keys move between them. "+ Add model" saves another model
+ * as a card; Edit changes one and lets you test it without choosing it.
+ */
 export function ProviderPicker({ commit, compact = false }: { commit: CommitSettings; compact?: boolean }): React.JSX.Element {
   const aiProvider = useSettingsStore((s) => s.aiProvider)
   const openrouterConfigured = useSettingsStore((s) => s.openrouterConfigured)
   const geminiConfigured = useSettingsStore((s) => s.geminiConfigured)
-  const openaiCompatibleUrl = useSettingsStore((s) => s.openaiCompatibleUrl)
-  const openaiCompatibleModel = useSettingsStore((s) => s.openaiCompatibleModel)
+  const modelPresets = useSettingsStore((s) => s.modelPresets)
+  const activeModelPreset = useSettingsStore((s) => s.activeModelPreset)
+  const deleteModelPreset = useSettingsStore((s) => s.deleteModelPreset)
   const [error, setError] = useState<string | null>(null)
   const transcriptionSource = useSettingsStore((s) => s.transcriptionSource)
   const [movedToLocal, setMovedToLocal] = useState(false)
-  const choose = async (id: AiProvider): Promise<void> => {
+  // The card being added ('new') or edited (its id), and the one waiting for a delete confirmation.
+  const [editing, setEditing] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState<string | null>(null)
+  // The card just added, whose form stays open so it can be tested.
+  const [justSaved, setJustSaved] = useState<string | null>(null)
+  const choose = async (id: AiProvider, presetId?: string): Promise<void> => {
     let moved: TranscriptionSource | undefined
     const failed = await commit((current) => {
       const patch = aiProviderChange(id, current, transcriptionMovedByProvider)
       moved = patch.transcriptionSource
-      return patch
+      return presetId ? { ...patch, activeModelPreset: presetId } : patch
     })
     setError(failed)
     if (failed) return
@@ -73,43 +112,119 @@ export function ProviderPicker({ commit, compact = false }: { commit: CommitSett
     if (moved === 'cloud') transcriptionMovedByProvider = false
     setMovedToLocal(transcriptionMovedByProvider)
   }
+  const remove = async (id: string): Promise<void> => {
+    try {
+      await deleteModelPreset(id)
+      setError(null)
+      if (editing === id) setEditing(null)
+    } catch (err) {
+      setError(errorMessage(err, 'Could not delete this model.'))
+    }
+    setDeleting(null)
+  }
+
+  const customChosen = aiProvider === 'openai-compatible' && modelPresets.some((p) => p.id === activeModelPreset)
+  const nothingChosen = aiProvider === 'openai-compatible' && !customChosen
+  const editingPreset = modelPresets.find((p) => p.id === editing)
+  const deletingPreset = modelPresets.find((p) => p.id === deleting)
+  const tile = (chosen: boolean): string => cn(
+    'glass-tile glass-tile-hover flex w-full flex-col items-start rounded-xl text-left transition-all',
+    compact ? 'p-2.5' : 'p-3', chosen && 'glass-selected'
+  )
 
   return (
     <div>
-      <div
-        role="radiogroup"
-        aria-label="AI provider"
-        className={cn(compact ? 'flex items-center gap-1 rounded-xl bg-black/20 p-1' : 'grid grid-cols-1 gap-2 sm:grid-cols-3')}
-      >
-        {PROVIDER_CHOICES.map((choice) => {
-          const selected = aiProvider === choice.id
-          const ready = isConfigured(choice.id, { openrouterConfigured, geminiConfigured, openaiCompatibleUrl, openaiCompatibleModel })
+      <div role="radiogroup" aria-label="AI provider" className={cn('grid gap-2', compact ? 'grid-cols-2' : 'grid-cols-1 sm:grid-cols-3')}>
+        {PROVIDER_CHOICES.map((choice, index) => {
+          const chosen = aiProvider === choice.id
+          const ready = choice.id === 'claude-plan' || (choice.id === 'openrouter' ? openrouterConfigured : geminiConfigured)
           return (
             <button
               key={choice.id}
               type="button"
               role="radio"
-              aria-checked={selected}
-              tabIndex={selected ? 0 : -1}
-              onKeyDown={onRadioKeyDown}
+              aria-checked={chosen}
+              tabIndex={chosen || (nothingChosen && index === 0) ? 0 : -1}
+              onKeyDown={onCardKeyDown}
               onClick={() => void choose(choice.id)}
-              className={compact
-                ? cn('flex-1 rounded-lg py-1 text-xs font-medium transition-colors', selected ? 'bg-accent text-accent-ink' : 'text-ink-muted hover:text-ink')
-                : cn('glass-tile glass-tile-hover flex flex-col items-start rounded-xl p-3 text-left transition-all', selected && 'glass-selected')}
+              className={tile(chosen)}
             >
-              {compact ? choice.title : (
-                <>
-                  <span className="flex w-full items-center justify-between gap-2">
-                    <span className="text-sm font-semibold text-ink">{choice.title}</span>
-                    {ready && <Check aria-label="Set up" className="h-3.5 w-3.5 text-success" />}
-                  </span>
-                  <span className="mt-1 text-2xs leading-relaxed text-ink-muted">{choice.description}</span>
-                </>
-              )}
+              <span className="flex w-full items-center justify-between gap-2">
+                <span className="text-sm font-semibold text-ink">{choice.title}</span>
+                <Chosen chosen={chosen} />
+              </span>
+              {!compact && <span className="mt-1 text-2xs leading-relaxed text-ink-muted">{choice.description}</span>}
+              {!ready && <span className="mt-1 text-2xs text-ink-subtle">Needs a key</span>}
             </button>
           )
         })}
+        {modelPresets.map((preset) => {
+          const chosen = aiProvider === 'openai-compatible' && preset.id === activeModelPreset
+          const label = modelPresetLabel(preset)
+          return (
+            <div key={preset.id} className="relative">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={chosen}
+                tabIndex={chosen ? 0 : -1}
+                onKeyDown={onCardKeyDown}
+                onClick={() => void choose('openai-compatible', preset.id)}
+                className={cn(tile(chosen), 'pr-16')}
+              >
+                <span className="flex w-full items-center gap-2">
+                  <span className="min-w-0 truncate text-sm font-semibold text-ink" title={label}>{label}</span>
+                  <Chosen chosen={chosen} />
+                </span>
+                <span className="mt-1 w-full truncate font-mono text-2xs text-ink-muted" title={`${preset.model} · ${preset.url}`}>
+                  {preset.name ? `${preset.model} · ${endpointHost(preset.url)}` : preset.url}
+                </span>
+                <span className="mt-1.5 flex flex-wrap gap-1">
+                  {preset.keySaved && <Badge tone="success">Key saved</Badge>}
+                  {isLocalEndpoint(preset.url) && <Badge>This computer or network</Badge>}
+                  {preset.vision === 'on' && <Badge>Reads images</Badge>}
+                </span>
+              </button>
+              <span className="absolute right-1.5 top-1.5 flex gap-0.5">
+                <Button size="sm" variant="ghost" iconOnly aria-label={`Edit ${label}`} tooltip="Edit or test"
+                  icon={<Pencil className="h-3.5 w-3.5" />} onClick={() => { setDeleting(null); setEditing(preset.id) }} />
+                <Button size="sm" variant="ghost" iconOnly aria-label={`Delete ${label}`} tooltip="Delete"
+                  icon={<Trash2 className="h-3.5 w-3.5" />} onClick={() => { setEditing(null); setDeleting(preset.id) }} />
+              </span>
+            </div>
+          )
+        })}
+        <button
+          type="button"
+          onClick={() => { setDeleting(null); setEditing('new') }}
+          disabled={modelPresets.length >= MAX_MODEL_PRESETS}
+          className={cn('flex w-full items-center justify-center gap-1.5 rounded-xl border border-dashed border-white/15 text-sm text-ink-muted transition-colors hover:border-white/30 hover:text-ink disabled:opacity-50',
+            compact ? 'p-2.5' : 'min-h-[4.5rem] p-3')}
+        >
+          <Plus className="h-4 w-4" aria-hidden /> Add model
+        </button>
       </div>
+      {deletingPreset && (
+        <Callout tone="warning" stacked className="mt-2" action={
+          <span className="flex gap-2">
+            <Button size="sm" variant="danger" onClick={() => void remove(deletingPreset.id)}>Delete</Button>
+            <Button size="sm" variant="ghost" onClick={() => setDeleting(null)}>Cancel</Button>
+          </span>
+        }>
+          Delete “{modelPresetLabel(deletingPreset)}” and its saved key?
+          {deletingPreset.id === activeModelPreset && aiProvider === 'openai-compatible' && ' It is the model in use, so clips cannot be made until you choose another.'}
+        </Callout>
+      )}
+      {editing && (editing === 'new' || editingPreset) && (
+        <ModelPresetForm
+          key={editing}
+          preset={editingPreset}
+          justSaved={editing === justSaved}
+          onClose={() => { setEditing(null); setJustSaved(null) }}
+          onSaved={(id) => { setJustSaved(id); setEditing(id) }}
+          onMovedToLocal={() => { transcriptionMovedByProvider = true; setMovedToLocal(true) }}
+        />
+      )}
       {error && <p role="alert" className="mt-2 text-xs text-danger">{error}</p>}
       {movedToLocal && aiProvider !== 'openrouter' && transcriptionSource === 'local' && (
         <p role="status" className="mt-2 text-xs text-ink-muted">
@@ -217,26 +332,42 @@ export function CheckList({ checks }: { checks: ProviderCheck[] }): React.JSX.El
  * Tries the saved provider: its model list, a short JSON request with the saved model and, for a
  * custom endpoint, a small image. Saves anything still being typed first.
  */
-function TestConnection({ provider, keys, onModels, commit }: {
+function TestConnection({ provider, keys, onModels, preset }: {
   provider: AiProvider
-  keys: Keys
+  /** Keys still being typed are saved first; a saved model's key is already saved with it. */
+  keys?: Keys
   onModels?: (models: string[]) => void
-  /** Lets the result switch "This model can read images" for a custom endpoint. */
-  commit?: CommitSettings
+  /** A saved model to test, chosen or not. Its "can read images" advice changes that card. */
+  preset?: PublicModelPreset
 }): React.JSX.Element {
   const [testing, setTesting] = useState(false)
   const [result, setResult] = useState<ProviderTestResult | null>(null)
-  const visionOn = useSettingsStore((s) => s.openaiCompatibleVision === 'on')
+  const saveModelPreset = useSettingsStore((s) => s.saveModelPreset)
+  const visionOn = preset?.vision === 'on'
   // A result is about the URL and model it tested. Once either changes, it no longer applies.
-  const subject = useSettingsStore((s) => testSubject(provider, s))
+  const savedSubject = useSettingsStore((s) => testSubject(provider, s))
+  const geminiModel = useSettingsStore((s) => s.geminiModel)
+  const subject = preset
+    ? testSubject('openai-compatible', { openaiCompatibleUrl: preset.url, openaiCompatibleModel: preset.model, geminiModel })
+    : savedSubject
   const current = result && (result.subject === subject || !result.subject) ? result : null
+  const [adviceError, setAdviceError] = useState<string | null>(null)
+  const setVision = async (on: boolean): Promise<void> => {
+    if (!preset) return
+    try {
+      await saveModelPreset({ id: preset.id, name: preset.name, url: preset.url, model: preset.model, apiKey: null, vision: on ? 'on' : 'off', timeout: preset.timeout })
+      setAdviceError(null)
+    } catch (err) {
+      setAdviceError(errorMessage(err, 'Could not change this setting.'))
+    }
+  }
 
   const run = async (): Promise<void> => {
     setTesting(true)
     try {
-      await keys.persist()
+      await keys?.persist()
       await whenSettingsSaved()
-      const outcome = await getApi().settings.testAiProvider(provider)
+      const outcome = await getApi().settings.testAiProvider(provider, preset?.id)
       setResult(outcome)
       onModels?.(outcome.models)
     } catch (err) {
@@ -246,7 +377,7 @@ function TestConnection({ provider, keys, onModels, commit }: {
     }
   }
 
-  const advice = !testing && commit && current ? visionAdvice(provider, current.readsImages, visionOn) : null
+  const advice = !testing && preset && current ? visionAdvice(provider, current.readsImages, visionOn) : null
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-3">
@@ -254,21 +385,24 @@ function TestConnection({ provider, keys, onModels, commit }: {
           Test connection
         </Button>
         {testing && provider !== 'openrouter' && (
-          <span role="status" className="text-2xs text-ink-subtle">Sending short test requests. A local model can take a minute to load.</span>
+          <span role="status" className="text-2xs text-ink-subtle">
+            {provider === 'claude-plan' ? 'Asking Claude Code a short question, which uses a little of your plan.' : 'Sending short test requests. A local model can take a minute to load.'}
+          </span>
         )}
         {!testing && current && <Outcome ok={current.ok}>{current.message}</Outcome>}
       </div>
       {!testing && current && current.checks.length > 1 && <CheckList checks={current.checks} />}
-      {advice === 'turn-on' && commit && (
-        <Callout tone="success" stacked action={<Button size="sm" onClick={() => void commit({ openaiCompatibleVision: 'on' })}>Turn on image reading</Button>}>
+      {advice === 'turn-on' && (
+        <Callout tone="success" stacked action={<Button size="sm" onClick={() => void setVision(true)}>Turn on image reading</Button>}>
           This model read the test image. Turn on “This model can read images” so the AI can check facecam framing.
         </Callout>
       )}
-      {advice === 'turn-off' && commit && (
-        <Callout tone="warning" stacked action={<Button size="sm" onClick={() => void commit({ openaiCompatibleVision: 'off' })}>Turn off image reading</Button>}>
+      {advice === 'turn-off' && (
+        <Callout tone="warning" stacked action={<Button size="sm" onClick={() => void setVision(false)}>Turn off image reading</Button>}>
           This model could not read the test image. With image reading on, framing checks fail and fall back to face tracking.
         </Callout>
       )}
+      {adviceError && <p role="alert" className="text-xs text-danger">{adviceError}</p>}
     </div>
   )
 }
@@ -278,13 +412,9 @@ export function ProviderFields({ commit, keys, compact = false }: { commit: Comm
   const aiProvider = useSettingsStore((s) => s.aiProvider)
   const openrouterConfigured = useSettingsStore((s) => s.openrouterConfigured)
   const geminiConfigured = useSettingsStore((s) => s.geminiConfigured)
-  const openaiCompatibleConfigured = useSettingsStore((s) => s.openaiCompatibleConfigured)
   const geminiModel = useSettingsStore((s) => s.geminiModel)
-  const openaiCompatibleUrl = useSettingsStore((s) => s.openaiCompatibleUrl)
-  const openaiCompatibleModel = useSettingsStore((s) => s.openaiCompatibleModel)
-  const openaiCompatibleVision = useSettingsStore((s) => s.openaiCompatibleVision)
-  const openaiCompatibleTimeout = useSettingsStore((s) => s.openaiCompatibleTimeout)
-  const timeoutId = useId()
+  const modelPresets = useSettingsStore((s) => s.modelPresets)
+  const activeModelPreset = useSettingsStore((s) => s.activeModelPreset)
   const sourceContextWebResearch = useSettingsStore((s) => s.sourceContextWebResearch)
   const [models, setModels] = useState<string[]>([])
   useEffect(() => { setModels([]) }, [aiProvider])
@@ -323,6 +453,10 @@ export function ProviderFields({ commit, keys, compact = false }: { commit: Comm
     </p>
   )
 
+  if (aiProvider === 'claude-plan') {
+    return <ClaudePlanFields commit={commit} test={<TestConnection provider="claude-plan" />}>{onlyOpenRouter}</ClaudePlanFields>
+  }
+
   if (aiProvider === 'gemini') {
     return (
       <div className="space-y-3">
@@ -354,65 +488,158 @@ export function ProviderFields({ commit, keys, compact = false }: { commit: Comm
     )
   }
 
+  // OpenAI-compatible: the chosen saved model plans clips. Cards above add, edit and choose them.
+  const active = modelPresets.find((preset) => preset.id === activeModelPreset)
   return (
     <div className="space-y-3">
-      <TextSetting
-        label="Endpoint URL"
-        hint="The base URL of the server, usually ending in /v1. Plain http is fine on this computer or your own network."
-        value={openaiCompatibleUrl}
-        placeholder="http://localhost:11434/v1"
-        validate={validateUrl}
-        commit={(value) => commit({ openaiCompatibleUrl: value })}
-      />
-      {looksLikeOllama(openaiCompatibleUrl) && (
+      {active ? (
+        <>
+          <p className="px-1 text-xs text-ink-muted">
+            Clips are planned by <span className="font-medium text-ink">{modelPresetLabel(active)}</span>
+            {' '}(<span className="font-mono">{active.model}</span> at {endpointHost(active.url)}). Use its card’s edit button to change it.
+          </p>
+          {looksLikeOllama(active.url) && <OllamaContextWarning />}
+          <TestConnection provider="openai-compatible" preset={active} />
+        </>
+      ) : (
         <Callout tone="warning">
-          Ollama uses a small context by default (4,096 tokens on most computers) and cuts a long transcript down to fit
-          without an error, so clips are picked from part of the video. Set <code>OLLAMA_CONTEXT_LENGTH=32768</code> or
-          more for the Ollama server, then restart it.
+          {modelPresets.length > 0
+            ? 'Choose one of your saved models above to make clips with it.'
+            : 'Add a model above: its endpoint URL, model name and, if the server needs one, an API key.'}
         </Callout>
       )}
+      {onlyOpenRouter}
+    </div>
+  )
+}
+
+function OllamaContextWarning(): React.JSX.Element {
+  return (
+    <Callout tone="warning">
+      Ollama uses a small context by default (4,096 tokens on most computers) and cuts a long transcript down to fit
+      without an error, so clips are picked from part of the video. Set <code>OLLAMA_CONTEXT_LENGTH=32768</code> or
+      more for the Ollama server, then restart it.
+    </Callout>
+  )
+}
+
+/**
+ * Adds a saved model (no `preset`) or edits one. The key typed here stays in this form until Save
+ * sends it to main with the rest; it is never written to the card in use while typing. Editing a
+ * card offers Test connection for it, chosen or not, which also lists the server's models.
+ */
+export function ModelPresetForm({ preset, onClose, onSaved, onMovedToLocal, justSaved = false }: {
+  preset?: PublicModelPreset
+  onClose: () => void
+  /** A new card was saved: the form stays open on it, so it can be tested right away. */
+  onSaved?: (id: string) => void
+  /** Saving chose the card and moved speech to text to Local Whisper (no OpenRouter key). */
+  onMovedToLocal?: () => void
+  justSaved?: boolean
+}): React.JSX.Element {
+  const saveModelPreset = useSettingsStore((s) => s.saveModelPreset)
+  const [name, setName] = useState(preset?.name ?? '')
+  const [url, setUrl] = useState(preset?.url ?? '')
+  const [model, setModel] = useState(preset?.model ?? '')
+  const [apiKey, setApiKey] = useState('')
+  const [removeKey, setRemoveKey] = useState(false)
+  const [vision, setVision] = useState<'on' | 'off'>(preset?.vision ?? 'off')
+  const [timeout, setWait] = useState<OpenaiCompatibleTimeout>(preset?.timeout ?? DEFAULT_OPENAI_COMPATIBLE_TIMEOUT)
+  const [error, setError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [models, setModels] = useState<string[]>([])
+  const nameId = useId()
+  const urlId = useId()
+  const modelId = useId()
+  const listId = useId()
+  const timeoutId = useId()
+  // "Turn on image reading" after a test saves the card; the open form follows it.
+  const savedVision = preset?.vision
+  useEffect(() => { if (savedVision) setVision(savedVision) }, [savedVision])
+  // A saved key belongs to its server; main drops it when the card moves to another one.
+  const origin = (value: string): string | null => { try { return new URL(value.trim()).origin } catch { return null } }
+  const serverChanged = Boolean(preset?.keySaved) && origin(url) !== null && origin(url) !== origin(preset?.url ?? '')
+
+  const save = async (): Promise<void> => {
+    const problem = (!url.trim() ? 'Enter the endpoint URL.' : validateUrl(url.trim()))
+      ?? (!model.trim() ? 'Enter the model name.' : validateModel(model.trim()))
+    if (problem) { setError(problem); return }
+    setSaving(true)
+    try {
+      const before = useSettingsStore.getState()
+      await saveModelPreset({
+        ...(preset ? { id: preset.id } : {}), name, url: url.trim(), model: model.trim(),
+        apiKey: apiKey.trim() ? apiKey.trim() : removeKey ? '' : null, vision, timeout
+      })
+      const after = useSettingsStore.getState()
+      if (before.transcriptionSource === 'cloud' && after.transcriptionSource === 'local') onMovedToLocal?.()
+      const added = preset ? undefined : after.modelPresets.find((p) => !before.modelPresets.some((q) => q.id === p.id))
+      if (added && onSaved) onSaved(added.id)
+      else onClose()
+    } catch (err) {
+      setError(errorMessage(err, 'Could not save this model.'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const title = preset ? `Edit “${modelPresetLabel(preset)}”` : 'Add a model'
+  return (
+    <div role="group" aria-label={title} className="glass-tile mt-3 space-y-3 rounded-2xl p-3">
+      <p className="text-sm font-semibold text-ink">{title}</p>
+      <Field label="Name (optional)" htmlFor={nameId} hint="What the card says. Leave empty to show the model and server.">
+        <TextInput id={nameId} value={name} maxLength={MAX_MODEL_PRESET_NAME} placeholder="Groq GPT-OSS"
+          onChange={(event) => { setName(event.target.value); setError(null) }} />
+      </Field>
+      <Field label="Endpoint URL" htmlFor={urlId} hint="The base URL of the server, usually ending in /v1. Plain http is fine on this computer or your own network.">
+        <TextInput id={urlId} mono value={url} placeholder="https://api.groq.com/openai/v1"
+          onChange={(event) => { setUrl(event.target.value); setError(null) }} />
+      </Field>
+      {looksLikeOllama(url) && <OllamaContextWarning />}
+      <Field label="Model name" htmlFor={modelId} hint="The model the server should use, such as gpt-4o-mini or llama3.1.">
+        <TextInput id={modelId} mono value={model} placeholder="openai/gpt-oss-120b" list={models.length > 0 ? listId : undefined}
+          onChange={(event) => { setModel(event.target.value); setError(null) }} />
+        {models.length > 0 && <datalist id={listId}>{models.map((option) => <option key={option} value={option} />)}</datalist>}
+      </Field>
       <div className="glass-tile rounded-2xl px-3 py-2.5">
         <ApiKeyInput
           label="API key (optional)"
-          value={keys.drafts.openaiCompatibleApiKey}
-          configured={openaiCompatibleConfigured}
-          onChange={(v) => keys.setDraft('openaiCompatibleApiKey', v)}
-          onRemove={() => void keys.remove('openaiCompatibleApiKey')}
-          onBlur={() => void keys.persist()}
+          value={apiKey}
+          configured={Boolean(preset?.keySaved) && !removeKey && !serverChanged}
+          onChange={(value) => { setApiKey(value); setRemoveKey(false); setError(null) }}
+          onRemove={() => { setApiKey(''); setRemoveKey(true) }}
           placeholder="sk-…"
-          description="Leave empty for a local server that needs none."
+          description={serverChanged
+            ? 'This card now points at another server, so its saved key is removed when you save. Enter the key for the new server.'
+            : removeKey ? 'The saved key is removed when you save.' : 'Leave empty for a local server that needs none.'}
         />
       </div>
-      <TextSetting
-        label="Model name"
-        hint="The model the server should use, such as gpt-4o-mini or llama3.1. Use Test connection to list what the server offers."
-        value={openaiCompatibleModel}
-        placeholder="gpt-4o-mini"
-        validate={validateModel}
-        suggestions={models}
-        commit={(value) => commit({ openaiCompatibleModel: value })}
-      />
       <SettingRow
         title="This model can read images"
         description="Lets smart framing look at video frames. Leave off for text-only models, or framing falls back to its built-in face tracking."
-        control={<Switch label="This model can read images" checked={openaiCompatibleVision === 'on'} onChange={(on) => void commit({ openaiCompatibleVision: on ? 'on' : 'off' })} />}
+        control={<Switch label="This model can read images" checked={vision === 'on'} onChange={(on) => setVision(on ? 'on' : 'off')} />}
       />
       <SettingRow
         title={<label htmlFor={timeoutId}>Wait for a reply</label>}
         description="How long to wait for one answer before giving up. Local models on a CPU can need many minutes for a long video."
         control={
-          <Select
-            id={timeoutId}
-            size="sm"
-            className="w-32"
-            value={openaiCompatibleTimeout}
+          <Select id={timeoutId} size="sm" className="w-32" value={timeout}
             options={OPENAI_COMPATIBLE_TIMEOUTS.map((minutes) => ({ value: minutes, label: `${minutes} minutes` }))}
-            onChange={(value) => void commit({ openaiCompatibleTimeout: value as OpenaiCompatibleTimeout })}
-          />
+            onChange={(value) => setWait(value as OpenaiCompatibleTimeout)} />
         }
       />
-      <TestConnection provider="openai-compatible" keys={keys} onModels={setModels} commit={commit} />
-      {onlyOpenRouter}
+      {error && <p role="alert" className="text-xs text-danger">{error}</p>}
+      {justSaved && <p role="status" className="text-xs text-success">Saved as a card. Test it below, or close this.</p>}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="primary" size="sm" loading={saving} onClick={() => void save()}>{preset ? 'Save changes' : 'Save model'}</Button>
+        <Button variant="ghost" size="sm" onClick={onClose}>{preset ? 'Close' : 'Cancel'}</Button>
+      </div>
+      {preset && (
+        <div className="space-y-2 border-t border-white/[0.06] pt-3">
+          <p className="text-2xs text-ink-subtle">Tests this model as saved, without choosing it. Save your changes first to test them.</p>
+          <TestConnection provider="openai-compatible" preset={preset} onModels={setModels} />
+        </div>
+      )}
     </div>
   )
 }

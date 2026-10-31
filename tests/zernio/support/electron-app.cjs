@@ -31,8 +31,9 @@ function playwright() {
 function buildApp(appDir = process.env.BRIDGECLIP_E2E_APP_DIR || path.join(os.tmpdir(), 'bridgeclip-e2e-app'), { skipBuild = process.env.BRIDGECLIP_E2E_SKIP_BUILD === '1' } = {}) {
   fs.mkdirSync(appDir, { recursive: true })
   if (!skipBuild || !fs.existsSync(path.join(appDir, 'out/main/index.js'))) {
-    const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx'
-    execFileSync(npx, ['electron-vite', 'build', '--outDir', path.join(appDir, 'out')], { cwd: ROOT, stdio: 'inherit' })
+    // The CLI runs on this Node directly: Windows refuses to start npx.cmd without a shell (EINVAL).
+    const cli = path.join(ROOT, 'node_modules', 'electron-vite', 'bin', 'electron-vite.js')
+    execFileSync(process.execPath, [cli, 'build', '--outDir', path.join(appDir, 'out')], { cwd: ROOT, stdio: 'inherit' })
   }
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
   fs.writeFileSync(path.join(appDir, 'package.json'), JSON.stringify({ name: pkg.name, productName: pkg.productName, version: pkg.version, main: 'out/main/index.js' }, null, 2))

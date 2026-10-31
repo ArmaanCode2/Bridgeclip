@@ -36,6 +36,16 @@ AI_PROVIDER_ERRORS = {
     "invalid_response": "AI provider returned an invalid response",
     "model_missing": "AI model is not configured",
     "url_missing": "AI endpoint URL is not configured",
+    # The Claude plan, through Claude Code.
+    "claude_auth": "Claude Code is not signed in",
+    "claude_billing": "Claude Code is not using your Claude plan",
+    "claude_model": "Your Claude plan cannot use this model",
+    "claude_timeout": "Claude Code took too long to answer",
+    "images_off": "Read images is off for your Claude plan",
+    "not_installed": "Claude Code could not be started",
+    "outdated": "Claude Code is too old for BridgeClip",
+    "plan_limit": "Your Claude plan reached its usage limit",
+    "too_long": "This request is too long for the chosen Claude model",
 }
 
 

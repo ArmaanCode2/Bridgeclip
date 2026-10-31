@@ -1756,7 +1756,8 @@ VISION_SCHEMA: dict[str, Any] = {
 # a row turn vision off for the run. A model too slow for one frame, or a rate
 # limit still in force after the client waited, would hold up every later frame.
 VISION_FATAL_REASONS = ("auth", "model_not_found", "endpoint_not_found", "model_missing", "url_missing",
-                        "timeout", "rate_limit", "quota")
+                        "timeout", "rate_limit", "quota", "plan_limit", "claude_auth", "claude_billing", "claude_model",
+                        "claude_timeout", "not_installed", "outdated")
 VISION_REJECTIONS_BEFORE_OFF = 2
 # Longest wait for one frame check from a custom endpoint, whatever the planner may wait.
 VISION_TIMEOUT_LIMIT_SECONDS = 300.0

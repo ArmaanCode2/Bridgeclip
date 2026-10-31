@@ -10,6 +10,7 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from dataclasses import replace
 from pathlib import Path
+from clip_engine.services.claude_plan import raise_if_stopped
 from clip_engine.error_policy import NoClipCandidatesError
 
 from clip_engine.services.coherence_review import CLIP_QUESTIONS, CUT_QUESTIONS, CoherenceReviewer, check_threshold, dialogue
@@ -155,6 +156,7 @@ async def review_candidate(c, reviewer):
             'source_context': reviewer.source_context}
         judgment = await reviewer.service.evaluate(state, CUT_QUESTIONS)
         cuts.append({'interval': [a, b], 'questions': questions(CUT_QUESTIONS, [judgment], reviewer.policy['cut_threshold'], reviewer.policy)})
+    raise_if_stopped()
     accepted = accepted and all(q['probability'] is not None and q['probability'] >= q['threshold'] for cut in cuts for q in cut['questions'])
     c['review'] = {'signature': signature(c), 'reviewed_at': datetime.now(timezone.utc).isoformat(),
         'decision': 'passes' if accepted else 'needs_attention',

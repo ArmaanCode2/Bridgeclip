@@ -2,8 +2,9 @@
 Chat-completions client for AI providers other than OpenRouter.
 
 OpenRouter keeps using ``openrouter.chat_completion`` unchanged. This module
-serves Google Gemini (through Google's OpenAI-compatible endpoint) and any
-user-supplied OpenAI-compatible endpoint (OpenAI, Ollama, LM Studio, vLLM...).
+serves Google Gemini (through Google's OpenAI-compatible endpoint), any
+user-supplied OpenAI-compatible endpoint (OpenAI, Ollama, LM Studio, vLLM...) and
+the person's Claude plan (through Claude Code, see ``claude_plan``).
 
 Compatible servers differ in what they accept. The JSON schema is always
 written into the prompt as well, because some servers accept ``response_format``
@@ -44,6 +45,10 @@ MAX_RATE_LIMIT_RETRIES = 2
 # How long an OpenAI-compatible endpoint may take to answer when no setting says.
 # Local models on a CPU can need many minutes for a long transcript.
 DEFAULT_OPENAI_COMPATIBLE_TIMEOUT_SECONDS = 1800.0
+# How long one Claude Code run may take. Max effort on a large model can take many minutes.
+DEFAULT_CLAUDE_PLAN_TIMEOUT_SECONDS = 1800.0
+# Stands in for a server address: no request to Claude Code opens a connection.
+CLAUDE_PLAN_BASE_URL = "http://claude-plan.invalid"
 
 # OpenAI-style reasoning models reject a temperature value, and Google asks for
 # Gemini 3 models to keep their default of 1.0: lower values can make them loop.
@@ -82,7 +87,7 @@ class AiClientError(OpenRouterError):
 
 def provider_of(settings: Any) -> str:
     provider = getattr(settings, "ai_provider", "openrouter")
-    return provider if provider in ("openrouter", "gemini", "openai-compatible") else "openrouter"
+    return provider if provider in ("openrouter", "gemini", "openai-compatible", "claude-plan") else "openrouter"
 
 
 def uses_openrouter(settings: Any) -> bool:
@@ -96,11 +101,13 @@ def supports_images(settings: Any) -> bool:
         return True
     if provider == "openai-compatible":
         return bool(getattr(settings, "openai_compatible_vision", False))
+    if provider == "claude-plan":
+        return bool(getattr(settings, "claude_plan_vision", False))
     return True
 
 
 def provider_label(settings: Any) -> str:
-    return {"gemini": "Gemini", "openai-compatible": "your AI endpoint"}.get(provider_of(settings), "OpenRouter")
+    return {"gemini": "Gemini", "openai-compatible": "your AI endpoint", "claude-plan": "your Claude plan"}.get(provider_of(settings), "OpenRouter")
 
 
 def active_model(settings: Any) -> str:
@@ -113,6 +120,8 @@ def active_model(settings: Any) -> str:
         if not model:
             raise AiClientError("AI model is not configured", reason="model_missing")
         return model
+    if provider == "claude-plan":
+        return str(getattr(settings, "claude_plan_model", ""))
     return str(getattr(settings, "planner_model", ""))
 
 
@@ -123,6 +132,8 @@ def has_credentials(settings: Any) -> bool:
         return bool(getattr(settings, "gemini_api_key", None))
     if provider == "openai-compatible":
         return bool(getattr(settings, "openai_compatible_url", None))
+    if provider == "claude-plan":
+        return bool(getattr(settings, "claude_plan_runner", None))
     return bool(getattr(settings, "openrouter_api_key", None))
 
 
@@ -136,6 +147,8 @@ def base_url_for(settings: Any) -> str:
         if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
             raise AiClientError("AI endpoint URL is not configured", reason="url_missing")
         return raw
+    if provider == "claude-plan":
+        return CLAUDE_PLAN_BASE_URL
     return str(settings.openrouter_base_url)
 
 
@@ -143,6 +156,8 @@ def request_timeout(settings: Any, default: float, limit: Optional[float] = None
     """Seconds to wait for a reply. A custom endpoint uses its own setting, since a
     local model can be far slower than a hosted one; ``limit`` caps it for calls
     made many times per job, such as one per video frame."""
+    if provider_of(settings) == "claude-plan":
+        return min(DEFAULT_CLAUDE_PLAN_TIMEOUT_SECONDS, limit) if limit else DEFAULT_CLAUDE_PLAN_TIMEOUT_SECONDS
     if provider_of(settings) != "openai-compatible":
         return default
     value = getattr(settings, "openai_compatible_timeout_seconds", None)
@@ -154,6 +169,10 @@ def get_ai_client(settings: Any, timeout: float = 600.0, limit: Optional[float] 
     """Create the HTTP client for the active provider."""
     provider = provider_of(settings)
     timeout = request_timeout(settings, timeout, limit)
+    if provider == "claude-plan":
+        from clip_engine.services.claude_plan import ClaudePlanTransport
+
+        return httpx.AsyncClient(base_url=CLAUDE_PLAN_BASE_URL, transport=ClaudePlanTransport(settings, timeout))
     if provider == "openrouter":
         return httpx.AsyncClient(
             base_url=settings.openrouter_base_url,

@@ -5,6 +5,7 @@ import { readdir, rm } from 'fs/promises'
 import { basename, dirname, isAbsolute, join, resolve } from 'path'
 import { DELETING_RUN_PREFIX, getJobOutput, isManuallyPosted, isRunFavorite, LIBRARY_FAVORITE_FILE, manualPostedFile, removeRunThumbnails } from './file-manager'
 import { logger } from './logger'
+import { removeRunSessions } from './claude-plan/sessions'
 import { parseJobOutput, type JobOutput } from '../shared/job-output'
 import { parseEditorProject } from '../shared/clip-editor'
 import { dismissJob, liveJobIds } from './job-manager'
@@ -67,6 +68,8 @@ export async function deleteLibraryRun(outputDir: unknown): Promise<void> {
     throw new Error('The Library run changed. Refresh and try again.')
   }
   dismissJob(basename(path))
+  // Before the files go: the run's list says which Claude sessions were its own.
+  removeRunSessions(trash)
   // Never follow the manifest's media paths. Remove only this validated run
   // directory; recursive rm unlinks internal symlinks rather than their targets.
   try { rmSync(trash, { recursive: true }) } catch {
@@ -89,6 +92,7 @@ export async function sweepDeletingRuns(): Promise<void> {
     try {
       const stat = lstatSync(path)
       if (!stat.isDirectory() || stat.isSymbolicLink() || dirname(realpathSync(path)) !== library) continue
+      removeRunSessions(path)
       await rm(path, { recursive: true })
     } catch {
       logger.warn('library.delete.sweep_failed', { message: 'A run left from an interrupted deletion could not be removed yet.' })

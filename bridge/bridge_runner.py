@@ -59,6 +59,33 @@ FAILURES = (
     (("saved transcript could not be reused",),
      "The transcript from the earlier run could not be used.",
      "It is missing, damaged, or covers a different part of the video. Use Run again to transcribe the video again."),
+    (("claude code is not signed in",),
+     "Claude Code is not signed in on this computer.",
+     "Open a terminal, run claude and sign in with your Claude plan, then press Continue."),
+    (("claude code could not be started",),
+     "BridgeClip could not start Claude Code.",
+     "Check that Claude Code is installed, then press Continue. You can also pick another AI provider in Settings → AI & transcription."),
+    (("claude code is too old",),
+     "This version of Claude Code is too old for BridgeClip.",
+     "Run claude update in a terminal, then press Continue."),
+    (("claude code is not using your claude plan",),
+     "Claude Code is not using your Claude plan, so BridgeClip stopped this job.",
+     "Open a terminal, run claude and sign in with your plan, then press Continue."),
+    (("claude code took too long",),
+     "Claude Code took too long to answer.",
+     "Pick a lower effort or a faster model on the Claude plan card in Settings → AI & transcription, then press Continue."),
+    (("read images is off for your claude plan",),
+     "This video has no speech, so your Claude plan needs to read its frames.",
+     "Turn on Read images on the Claude plan card in Settings → AI & transcription, then press Continue."),
+    (("your claude plan reached its usage limit",),
+     "Your Claude plan reached its usage limit.",
+     "Press Continue after it resets, or pick another AI provider in Settings → AI & transcription and press Continue."),
+    (("your claude plan cannot use this model",),
+     "Your Claude plan cannot use the chosen model.",
+     "Pick another model on the Claude plan card in Settings → AI & transcription, then press Continue."),
+    (("too long for the chosen claude model",),
+     "This request is too long for the chosen Claude model.",
+     "Pick a larger model on the Claude plan card in Settings → AI & transcription, then press Continue."),
     (("ai provider rejected the api key",),
      "Your AI provider rejected the API key.",
      "Check the key in Settings → AI & transcription and use Test connection."),
@@ -219,6 +246,9 @@ def missing_configuration(settings, transcribes: bool = True) -> list[str]:
             missing.append("OPENAI_COMPATIBLE_URL")
         if not getattr(settings, "openai_compatible_model", None):
             missing.append("OPENAI_COMPATIBLE_MODEL")
+    elif provider == "claude-plan":
+        if not getattr(settings, "claude_plan_runner", None):
+            missing.append("CLAUDE_PLAN_RUNNER")
     elif not settings.openrouter_api_key:
         missing.append("OPENROUTER_API_KEY")
     if not transcribes:

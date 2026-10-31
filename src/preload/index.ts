@@ -37,14 +37,14 @@ import type {
   AssistantSignInState
 } from '../shared/assistant'
 
-import type { AiProvider, LocalWhisperMode, OpenaiCompatibleTimeout, ProviderTestResult, TranscriptionSource } from '../shared/providers'
+import type { AiProvider, LocalWhisperMode, ModelPresetInput, ClaudePlanEffort, ClaudePlanModel, OpenaiCompatibleTimeout, ProviderTestResult, PublicModelPreset, TranscriptionSource } from '../shared/providers'
 import type { LocalWhisperDevice, LocalWhisperLanguage, LocalWhisperStatus, WhisperDeleteRequest, WhisperDeleteResult, WhisperListing, WhisperSetupProgress, WhisperSetupResult } from '../shared/whisper-models'
 import type { ScreenFraming, WebcamLocation, WebcamPosition } from '../shared/framing'
 import type { VideoEncoder } from '../shared/video-encoder'
 export type { ScreenFraming, VideoEncoder, WebcamLocation, WebcamPosition }
-export type { AiProvider, LocalWhisperDevice, LocalWhisperLanguage, LocalWhisperMode, LocalWhisperStatus, TranscriptionSource, WhisperDeleteRequest, WhisperDeleteResult, WhisperListing, WhisperSetupProgress, WhisperSetupResult }
+export type { AiProvider, ClaudePlanEffort, ClaudePlanModel, LocalWhisperDevice, LocalWhisperLanguage, LocalWhisperMode, LocalWhisperStatus, TranscriptionSource, WhisperDeleteRequest, WhisperDeleteResult, WhisperListing, WhisperSetupProgress, WhisperSetupResult }
 
-export type { ProviderCheck, ProviderTestResult } from '../shared/providers'
+export type { ModelPresetInput, ProviderCheck, ProviderTestResult, PublicModelPreset } from '../shared/providers'
 
 export interface ClipSettings extends JevThresholdSettings {
   openrouterConfigured: boolean
@@ -53,10 +53,19 @@ export interface ClipSettings extends JevThresholdSettings {
   openaiCompatibleConfigured: boolean
   aiProvider: AiProvider
   geminiModel: string
+  /** Saved OpenAI-compatible models (cards), without their keys. */
+  modelPresets: PublicModelPreset[]
+  /** The card that plans clips when the provider is OpenAI-compatible; '' when none is chosen. */
+  activeModelPreset: string
+  /** The chosen card's endpoint, read-only here: main fills these from `activeModelPreset`. */
   openaiCompatibleUrl: string
   openaiCompatibleModel: string
   openaiCompatibleVision: string
   openaiCompatibleTimeout: OpenaiCompatibleTimeout
+  claudePlanModel: ClaudePlanModel
+  claudePlanEffort: ClaudePlanEffort
+  /** 'on' when the Claude plan is sent video frames. */
+  claudePlanVision: string
   transcriptionSource: TranscriptionSource
   localWhisperMode: LocalWhisperMode
   localWhisperUrl: string
@@ -190,9 +199,15 @@ export interface BridgeClipAPI {
     storageUsage: (fresh?: boolean) => Promise<OutputStorageUsage>
     save: (settings: ClipSettings) => Promise<ClipSettings>
     replaceApiKey: (key: 'openrouterApiKey' | 'zernioApiKey' | 'geminiApiKey' | 'openaiCompatibleApiKey', value: string) => Promise<ClipSettings>
+    /** Creates (no id) or edits a saved model card. Its key goes to main and never comes back. */
+    saveModelPreset: (input: ModelPresetInput) => Promise<ClipSettings>
+    deleteModelPreset: (id: string) => Promise<ClipSettings>
     selectOutputDir: () => Promise<string | null>
-    /** Asks the provider chosen in saved settings for its models. Uses the saved key, never one from the page. */
-    testAiProvider: (provider: AiProvider) => Promise<ProviderTestResult>
+    /**
+     * Asks the provider chosen in saved settings for its models, or, with `presetId`, that saved
+     * model whether or not it is chosen. Uses the saved key, never one from the page.
+     */
+    testAiProvider: (provider: AiProvider, presetId?: string) => Promise<ProviderTestResult>
     /** Whether the saved Whisper choice can run: built-in Whisper importable, or a server that answers. */
     checkLocalWhisper: () => Promise<LocalWhisperStatus>
   }
@@ -397,8 +412,10 @@ const api: BridgeClipAPI = {
     storageUsage: (fresh) => ipcRenderer.invoke('settings:storageUsage', fresh === true),
     save: (settings) => ipcRenderer.invoke('settings:save', settings),
     replaceApiKey: (key, value) => ipcRenderer.invoke('settings:replaceApiKey', key, value),
+    saveModelPreset: (input) => ipcRenderer.invoke('settings:saveModelPreset', input),
+    deleteModelPreset: (id) => ipcRenderer.invoke('settings:deleteModelPreset', id),
     selectOutputDir: () => ipcRenderer.invoke('settings:selectOutputDir'),
-    testAiProvider: (provider) => ipcRenderer.invoke('settings:testAiProvider', provider),
+    testAiProvider: (provider, presetId) => ipcRenderer.invoke('settings:testAiProvider', provider, presetId),
     checkLocalWhisper: () => ipcRenderer.invoke('settings:checkLocalWhisper')
   },
   whisper: {

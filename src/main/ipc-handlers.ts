@@ -2,7 +2,10 @@ import { openEditor, saveEditor, runEditor, cancelEditor, replaceEditorSource } 
 import { anyEditorOperation, editorCloseReady, freeEditorMedia, readEditorProgress } from './clip-editor'
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { existsSync, realpathSync } from 'fs'
-import { loadSettings, publicSettings, replaceApiKey, savePublicSettings, type ApiKeyName, type PublicSettings } from './settings-store'
+import {
+  deleteModelPreset, loadSettings, publicSettings, replaceApiKey, saveModelPreset, savePublicSettings, settingsWithModelPreset,
+  type ApiKeyName, type PublicSettings
+} from './settings-store'
 import { getJobHistory, getJobOutput, generateThumbnail } from './file-manager'
 import { measureOutputStorage } from './output-storage'
 import { inspectEdits } from './edit-inspector'
@@ -81,8 +84,18 @@ export function registerIpcHandlers(getMainWindow: () => BrowserWindow | null): 
     return saved
   })
 
+  // Saved model cards. Their keys stay here; the renderer gets the settings back without them.
+  handle('settings:saveModelPreset', (_event, input: unknown) => saveModelPreset(input))
+  handle('settings:deleteModelPreset', (_event, id: unknown) => deleteModelPreset(id))
+
   // "Test connection" in Settings. Both use the saved settings; no key or provider reply reaches the renderer.
-  handle('settings:testAiProvider', (_event, provider: unknown) => testAiProvider(provider, loadSettings()))
+  // With a saved model's id, that card is tested whether or not it is the chosen one.
+  handle('settings:testAiProvider', (_event, provider: unknown, presetId: unknown) => {
+    const settings = loadSettings()
+    return presetId === undefined
+      ? testAiProvider(provider, settings)
+      : testAiProvider('openai-compatible', settingsWithModelPreset(settings, presetId))
+  })
   const checkWhisper = (): ReturnType<typeof checkLocalWhisper> => {
     const settings = loadSettings()
     return checkLocalWhisper(settings, {

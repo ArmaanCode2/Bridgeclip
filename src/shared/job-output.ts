@@ -159,6 +159,13 @@ function safeMetrics(value: unknown): Record<string, unknown> | null {
 }
 
 /** Validate external and persisted pipeline output before it reaches React. */
+/** The cost a run's row shows, or null. A run wholly on the Claude plan has none to show, not a cost of $0.00. */
+export function shownRunCost(costs: unknown): number | null {
+  if (!record(costs) || typeof costs.total_estimated_cost_usd !== 'number') return null
+  const planning = costs.planning
+  return costs.total_estimated_cost_usd === 0 && record(planning) && planning.provider === 'claude-plan' ? null : costs.total_estimated_cost_usd
+}
+
 export function parseJobOutput(value: unknown): JobOutput | null {
   if (!record(value) || !Array.isArray(value.clips) || value.clips.length > 1000) return null
   const clips: ClipArtifact[] = []

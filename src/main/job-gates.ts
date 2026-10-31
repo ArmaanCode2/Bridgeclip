@@ -1,4 +1,4 @@
-import { setupGaps, type AiProvider, type LocalWhisperMode, type ProviderSetupInput, type TranscriptionSource } from '../shared/providers'
+import { providerReadsImages, setupGaps, type AiProvider, type LocalWhisperMode, type ProviderSetupInput, type TranscriptionSource } from '../shared/providers'
 import { WHISPER_SETUP_MESSAGES, isWhisperModelName, type LocalWhisperStatus } from '../shared/whisper-models'
 
 /** The settings a job start depends on. A subset of AppSettings, so tests need not build the rest. */
@@ -9,10 +9,13 @@ export interface JobGateSettings {
   openaiCompatibleUrl: string
   openaiCompatibleModel: string
   openaiCompatibleVision: string
+  claudePlanVision: string
   transcriptionSource: TranscriptionSource
   localWhisperMode: LocalWhisperMode
   localWhisperUrl: string
 }
+
+export { claudePlanBlock } from '../shared/providers'
 
 export type ClippingMode = 'quality' | 'economy' | 'advanced'
 
@@ -50,7 +53,7 @@ export function setupInputFromSettings(settings: JobGateSettings): ProviderSetup
  * - Advanced mode picks models from OpenRouter's catalog, so it needs OpenRouter.
  * - Economy is an OpenRouter model preset; elsewhere it runs as Quality, with the
  *   saved model, and without the frame analysis the person asked to skip.
- * - A custom OpenAI-compatible model reads video frames only if the person said it can.
+ * - A custom OpenAI-compatible model or the Claude plan reads video frames only if the person said so.
  */
 export function gateJobStart(settings: JobGateSettings, request: JobGateRequest, options: { transcribes?: boolean } = {}): JobGateResult {
   // A run that continues from a saved transcript needs nothing for transcription.
@@ -72,8 +75,7 @@ export function gateJobStart(settings: JobGateSettings, request: JobGateRequest,
     }
   }
   const clippingMode: ClippingMode = !openrouter && requested === 'economy' ? 'quality' : requested
-  const analyzesFrames = openrouter || settings.aiProvider === 'gemini' || settings.openaiCompatibleVision === 'on'
-  const layoutVision = !analyzesFrames ? false : request.layoutVision
+  const layoutVision = !providerReadsImages(settings) ? false : request.layoutVision
   return { ok: true, clippingMode, layoutVision }
 }
 

@@ -1,11 +1,11 @@
 import { JEV_DEFAULTS, JEV_FEATURE_DEFAULTS } from '../../shared/jev-settings'
-import { DEFAULT_GEMINI_MODEL, DEFAULT_LOCAL_WHISPER_MODEL, DEFAULT_OPENAI_COMPATIBLE_TIMEOUT, describeGaps, metadataWriterGap, setupGaps, type SetupGap } from '../../shared/providers'
+import { DEFAULT_CLAUDE_PLAN_EFFORT, DEFAULT_CLAUDE_PLAN_MODEL, DEFAULT_GEMINI_MODEL, DEFAULT_LOCAL_WHISPER_MODEL, DEFAULT_OPENAI_COMPATIBLE_TIMEOUT, describeGaps, metadataWriterGap, setupGaps, type SetupGap } from '../../shared/providers'
 import { DEFAULT_SCREEN_FRAMING, DEFAULT_WEBCAM_LOCATION, DEFAULT_WEBCAM_POSITION } from '../../shared/framing'
 import { DEFAULT_VIDEO_ENCODER } from '../../shared/video-encoder'
 import { create } from 'zustand'
 import { errorMessage } from '../lib/utils'
 import { getApi } from '../lib/ipc'
-import type { ClipSettings, ToolStatus } from '../../preload/index'
+import type { ClipSettings, ModelPresetInput, ToolStatus } from '../../preload/index'
 
 interface SettingsState extends ClipSettings {
   loaded: boolean
@@ -20,6 +20,9 @@ interface SettingsState extends ClipSettings {
    */
   save: (settings: SettingsPatch) => Promise<void>
   replaceApiKey: (key: 'openrouterApiKey' | 'zernioApiKey' | 'geminiApiKey' | 'openaiCompatibleApiKey', value: string) => Promise<void>
+  /** Creates or edits a saved model card, in the save queue. Rejects with main's reason. */
+  saveModelPreset: (input: ModelPresetInput) => Promise<void>
+  deleteModelPreset: (id: string) => Promise<void>
   checkTools: () => Promise<void>
 }
 
@@ -37,10 +40,15 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   openaiCompatibleConfigured: false,
   aiProvider: 'openrouter',
   geminiModel: DEFAULT_GEMINI_MODEL,
+  modelPresets: [],
+  activeModelPreset: '',
   openaiCompatibleUrl: '',
   openaiCompatibleModel: '',
   openaiCompatibleVision: 'off',
   openaiCompatibleTimeout: DEFAULT_OPENAI_COMPATIBLE_TIMEOUT,
+  claudePlanModel: DEFAULT_CLAUDE_PLAN_MODEL,
+  claudePlanEffort: DEFAULT_CLAUDE_PLAN_EFFORT,
+  claudePlanVision: 'off',
   transcriptionSource: 'cloud',
   localWhisperMode: 'builtin',
   localWhisperUrl: '',
@@ -87,19 +95,9 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     })
   },
 
-  replaceApiKey: (key, value) => {
-    pendingSaves += 1
-    set({ saving: true })
-    const task = saveQueue.then(async () => {
-      const saved = await getApi().settings.replaceApiKey(key, value)
-      set({ ...pickSettings(saved), loaded: true })
-    })
-    saveQueue = task.catch(() => {})
-    return task.finally(() => {
-      pendingSaves -= 1
-      set({ saving: pendingSaves > 0 })
-    })
-  },
+  replaceApiKey: (key, value) => queued(set, () => getApi().settings.replaceApiKey(key, value)),
+  saveModelPreset: (input) => queued(set, () => getApi().settings.saveModelPreset(input)),
+  deleteModelPreset: (id) => queued(set, () => getApi().settings.deleteModelPreset(id)),
 
   checkTools: async () => {
     const request = ++latestToolCheck
@@ -117,6 +115,24 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   }
 }))
 
+/**
+ * Runs a settings change that main applies on its own (a key or a saved model) in the same queue as
+ * other saves, so a save waiting in the queue cannot write over it, and takes main's settings back.
+ */
+function queued(set: (state: Partial<SettingsState>) => void, change: () => Promise<ClipSettings>): Promise<void> {
+  pendingSaves += 1
+  set({ saving: true })
+  const task = saveQueue.then(async () => {
+    const saved = await change()
+    set({ ...pickSettings(saved), loaded: true })
+  })
+  saveQueue = task.catch(() => {})
+  return task.finally(() => {
+    pendingSaves -= 1
+    set({ saving: pendingSaves > 0 })
+  })
+}
+
 function pickSettings(s: ClipSettings): ClipSettings {
   return {
     jevThreshold: s.jevThreshold ?? JEV_DEFAULTS.jevThreshold,
@@ -132,10 +148,15 @@ function pickSettings(s: ClipSettings): ClipSettings {
     openaiCompatibleConfigured: s.openaiCompatibleConfigured,
     aiProvider: s.aiProvider ?? 'openrouter',
     geminiModel: s.geminiModel ?? DEFAULT_GEMINI_MODEL,
+    modelPresets: s.modelPresets ?? [],
+    activeModelPreset: s.activeModelPreset ?? '',
     openaiCompatibleUrl: s.openaiCompatibleUrl ?? '',
     openaiCompatibleModel: s.openaiCompatibleModel ?? '',
     openaiCompatibleVision: s.openaiCompatibleVision ?? 'off',
     openaiCompatibleTimeout: s.openaiCompatibleTimeout ?? DEFAULT_OPENAI_COMPATIBLE_TIMEOUT,
+    claudePlanModel: s.claudePlanModel ?? DEFAULT_CLAUDE_PLAN_MODEL,
+    claudePlanEffort: s.claudePlanEffort ?? DEFAULT_CLAUDE_PLAN_EFFORT,
+    claudePlanVision: s.claudePlanVision ?? 'off',
     transcriptionSource: s.transcriptionSource ?? 'cloud',
     localWhisperMode: s.localWhisperMode ?? 'builtin',
     localWhisperUrl: s.localWhisperUrl ?? '',

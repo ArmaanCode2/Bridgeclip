@@ -30,7 +30,7 @@ const REQUEST = {
 }
 
 /** job-start with every outside effect recorded; `resumable` stands in for the job list. */
-function setup(settingsPatch = {}, resumable = {}) {
+function setup(settingsPatch = {}, resumable = {}, claude = { state: 'connected', plan: 'max' }) {
   const calls = { enqueued: [], validated: [], whisperChecks: 0, advanced: [] }
   const settings = { ...READY, ...settingsPatch }
   const mod = loadJobStart({
@@ -42,6 +42,7 @@ function setup(settingsPatch = {}, resumable = {}) {
       runtimeEnvironment: () => ({}), preflightCheck: () => ({ ok: true }), validatePython: async () => ({ ok: true })
     },
     './provider-checks': { checkLocalWhisper: async () => { calls.whisperChecks++; return { available: true, modelCached: false } } },
+    './assistant/providers': { checkProvider: async () => { calls.claudeChecks = (calls.claudeChecks ?? 0) + 1; return claude } },
     './run-history': { createRunRecord: () => {}, finishRunRecord: () => {} },
     './job-manager': {
       enqueueJob: (jobId, config, outputDirectory, request) => {
@@ -125,4 +126,38 @@ test('a transcript path from the renderer never reaches a job', () => {
   const { validateJobConfig } = loadMain("export { validateJobConfig } from './src/main/validation'", { electron: {} })
   const config = validateJobConfig({ ...REQUEST, resumeTranscript: '/home/someone/secret.json' })
   assert.equal(config.resumeTranscript, undefined)
+})
+
+test('a job on the Claude plan stops before it starts when Claude Code cannot use the plan, and nothing is queued', async () => {
+  const claude = { aiProvider: 'claude-plan', claudePlanVision: 'off', transcriptionSource: 'local' }
+  for (const [status, words] of [
+    [{ state: 'not-installed', plan: null }, /not installed/],
+    [{ state: 'signed-out', plan: null }, /not signed in/],
+    [{ state: 'connected', plan: null }, /API key/],
+    [{ state: 'unknown', plan: null }, /did not report/]
+  ]) {
+    const { mod, calls } = setup({ ...claude, transcriptionSource: 'cloud', openrouterApiKey: 'sk-or' }, {}, status)
+    assert.match((await mod.startClipJobRequest(REQUEST)).error, words)
+    assert.deepEqual(calls.enqueued, [])
+  }
+})
+
+test('only a job on the Claude plan checks Claude Code', async () => {
+  const { mod, calls } = setup({ openrouterApiKey: 'sk-or' })
+  await mod.startClipJobRequest(REQUEST)
+  assert.equal(calls.claudeChecks, undefined)
+})
+
+test('a failed job continues on the Claude plan from its saved transcript, after a provider switch', async () => {
+  const { mod, calls } = setup({ aiProvider: 'claude-plan', claudePlanVision: 'off' }, { failed: { request: { ...REQUEST, clippingMode: 'advanced', plannerModel: 'x/y' }, transcript: '/runs/transcript.json' } })
+  const started = await mod.resumeClipJobRequest('failed')
+  assert.equal(started.error, undefined)
+  assert.equal(calls.claudeChecks, 1)
+  assert.equal(calls.whisperChecks, 0)
+  const { config } = calls.enqueued[0]
+  assert.equal(config.resumeTranscript, '/runs/transcript.json')
+  assert.equal(config.clippingMode, 'quality')
+  assert.equal(config.plannerModel, undefined)
+  // Frames stay off until the image switch is on.
+  assert.equal(config.layoutVision, false)
 })
