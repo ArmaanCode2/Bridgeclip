@@ -296,7 +296,8 @@ print(json.dumps(result))
       {
         cwd: enginePath,
         env: { ...runtimeEnvironment(), PYTHONPATH: enginePath },
-        timeout: 10000
+        // Loading the engine takes 8 to 10 seconds on a typical PC, longer while it is busy.
+        timeout: 30000
       }
     )
     const result = JSON.parse(stdout.trim()) as { status?: string; module?: string }
