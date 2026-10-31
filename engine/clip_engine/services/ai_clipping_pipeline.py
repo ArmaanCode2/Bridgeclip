@@ -985,7 +985,8 @@ class AIClippingPipeline:
                 ),
                 "requested_settings": {
                     "clipping_mode": self.settings.clipping_mode,
-                    "planner_model": self.settings.planner_model,
+                    # Gemini and custom endpoints plan with their own model, not the OpenRouter preset's.
+                    "planner_model": self.settings.planner_model if uses_openrouter(self.settings) else active_model(self.settings),
                     # A continued run transcribed nothing; Advanced mode then has no transcription model.
                     "transcription_model": (
                         "saved transcript" if request.resume_transcript_path

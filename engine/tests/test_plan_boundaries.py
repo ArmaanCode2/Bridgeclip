@@ -108,9 +108,33 @@ class TestDurationBounds:
         prompt = make_planner([])._build_system_prompt(5, 15, 90, ["short"])
         assert "Return up to 5 clips as JSON. Return fewer when fewer moments are strong" in prompt
         assert "Return exactly" not in prompt
-        assert "scroll-stopping" in prompt and "Use curiosity gaps" in prompt
+        assert "scroll-stopping" in prompt and "Name something specific that is said or happens in this clip" in prompt
         assert "NO OVERLAP: No two clips should share more than 5 seconds" in prompt
         assert "Jev" not in prompt and "Preferred length" not in prompt
+
+    def test_titles_are_not_steered_by_templates_or_word_lists(self):
+        # A planner copied "The Truth About ..." and "insane" from the old examples into its titles.
+        prompt = make_planner([])._build_system_prompt(5, 30, 60, ["short"])
+        for phrase in ("Truth About", "Get This Wrong", "curiosity gaps", "power words", '"insane"', '"brutal"', "stop scrolling"):
+            assert phrase not in prompt
+        assert "Never copy them into a title" in prompt
+
+    def test_the_line_format_names_the_segment_number_and_only_the_parts_present(self):
+        planner = make_planner([])
+        planner._transcript_has_speakers = planner._transcript_has_events = False
+        for prompt in (planner._build_system_prompt(5, 30, 60, ["short"]), planner._build_longform_system_prompt(3, 300, 900)):
+            assert "`[segment N] [start - end] text`" in prompt
+            assert "take these numbers, never times" in prompt
+            assert "Speaker labels" not in prompt and "Audio events" not in prompt
+        planner._transcript_has_speakers = planner._transcript_has_events = True
+        prompt = planner._build_system_prompt(5, 30, 60, ["short"])
+        assert "`[segment N] [start - end] (speaker) text (audio events)`" in prompt
+        assert "Speaker labels (such as S1, or C1S1 in a long recording)" in prompt and "Audio events such as (laughter)" in prompt
+
+    def test_moment_fields_ask_for_segment_numbers(self):
+        from clip_engine.services.intelligence_planner import MOMENT_SCHEMA
+        for field in ("topic_start_segment", "topic_end_segment", "setup_segment", "payoff_segment"):
+            assert "never a time in seconds" in MOMENT_SCHEMA["properties"][field]["description"]
 
     def test_jev_prompt_treats_duration_as_a_preference(self):
         planner = make_planner([], jev=True)
@@ -134,7 +158,10 @@ class TestParseBoundaries:
         assert len(plan.segments) == 1
         assert plan.segments[0].end_time_ms == 19_950
 
-    def test_rounding_below_minimum_filters_when_no_sentence_fits(self):
+    def test_rounding_a_fraction_below_minimum_pads_instead_of_filtering(self):
+        # The end snaps back to a sentence end 50 ms short of the only allowed length. That
+        # clip used to be filtered; the end is now padded into the pause after the sentence.
+        # A shortfall of a second or more is still filtered (test_length_repair.TestSnapShortfall).
         transcript = [
             TranscriptSegment(i * 5000, (i + 1) * 5000 - 50, "Sentence.", words=[
                 TranscriptWord("Sentence.", i * 5000, (i + 1) * 5000 - 50),
@@ -142,7 +169,8 @@ class TestParseBoundaries:
             for i in range(4)
         ]
         planner = make_planner(transcript, 15, 15)
-        assert planner._parse_clip_plan_response(completion([clip(0, 15.0)])).segments == []
+        segments = planner._parse_clip_plan_response(completion([clip(0, 15.0)])).segments
+        assert [(s.start_time_ms, s.end_time_ms) for s in segments] == [(0, 15000)]
 
     def test_long_clip_survives_with_default_bounds_passed(self):
         tr = make_transcript()
@@ -467,9 +495,18 @@ class TestJevOffPipeline:
         requests = []
 
         judged = []
+        repairs = []
+        set_checks = []
 
         async def call(model, messages, fallback_models=None, response_format=None):
             usage = {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001}
+            if response_format and response_format["json_schema"]["name"] == "clip_set_check":
+                set_checks.append(messages[1]["content"])  # no repeats found
+                return {"choices": [{"message": {"content": json.dumps({"same_incident": [], "retitle": []})}, "finish_reason": "stop"}]}, usage
+            if response_format and response_format["json_schema"]["name"] == "clip_length_repair":
+                # Leaves every pick as it was, so the engine's own length guards below still apply.
+                repairs.append(messages[1]["content"])
+                return {**completion([]), "choices": [{"message": {"content": json.dumps({"repairs": []})}, "finish_reason": "stop"}]}, usage
             if response_format and response_format["json_schema"]["name"] == "clip_judgment":
                 # The clip judge sees each clip's own words, never the planner's titles or scores.
                 text = messages[1]["content"]
@@ -509,6 +546,9 @@ class TestJevOffPipeline:
         context.assert_not_awaited()                          # no source-context model call
         assert transcribed == [(range_start, range_end)]      # only the selected range
         assert len(requests) == 1
+        # The < 5 s and > 90 s picks were offered for repair once; the answer changed nothing.
+        assert len(repairs) == 1 and "1 to 2." in repairs[0]
+        assert len(set_checks) == 1 and "Check clips 1 to 4." in set_checks[0]
         assert judged == [4]                                  # the in-range candidates, judged in one request
         assert requests[0][0] == "anthropic/claude-opus-5.5"
         assert requests[0][1] == ["google/gemini-3.8-flash", "openai/gpt-6-sol"]

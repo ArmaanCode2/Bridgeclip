@@ -26,6 +26,8 @@ class RoutingClient(httpx.AsyncClient):
 
     def __init__(self, answer):
         self.payloads = []
+        # The whole-set check after planning (final_check) finds no repeats, and is kept out of `payloads`.
+        self.set_checks = []
 
         class Body(httpx.AsyncByteStream):
             def __init__(self, body):
@@ -36,6 +38,9 @@ class RoutingClient(httpx.AsyncClient):
 
         async def handle(request):
             payload = json.loads(request.content)
+            if payload.get("response_format", {}).get("json_schema", {}).get("name") == "clip_set_check":
+                self.set_checks.append(payload)
+                return httpx.Response(200, stream=Body(completion(json.dumps({"same_incident": [], "retitle": []}))))
             self.payloads.append(payload)
             status, body = answer(payload)
             return httpx.Response(status, stream=Body(body))
@@ -157,10 +162,12 @@ class TestLongSourcesAreSearchedInParts:
             assert f"[segment {int(first // 5)}] [{first:.1f}" in text
             assert re.search(r"part \d of 4, covering", text)
             assert "Return up to " in payload["messages"][0]["content"]
-        assert len(seen) == 4 and all(m.startswith("Searching part") for m in seen)
+        assert len(seen) == 5 and all(m.startswith("Searching part") for m in seen[:4])
+        # Then one check of the whole set for repeated incidents and titles.
+        assert seen[4] == "Checking the clips for repeats..." and len(planner._http_client.set_checks) == 1
         # Ranked together: the best clips of every part, capped at the six asked for.
         assert len(result.segments) == 6
-        assert result.api_costs.attempts == 4 and result.api_costs.estimated_cost_usd == pytest.approx(4 * 0.0123)
+        assert result.api_costs.attempts == 5 and result.api_costs.estimated_cost_usd == pytest.approx(5 * 0.0123)
         assert all(f"Part {n} of 4" in result.insights for n in range(1, 5))
 
     def test_the_best_part_wins_the_ranking_and_clips_outside_a_part_are_dropped(self, no_sleep):

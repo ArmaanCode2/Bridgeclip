@@ -21,10 +21,12 @@ from typing import Any, Callable, Literal, Optional
 import httpx
 
 from clip_engine.config import DURATION_RANGES, get_settings, is_longform, resolve_clip_duration_bounds
-from clip_engine.services import clip_judge
+from clip_engine.services import clip_judge, final_check, length_repair
 from clip_engine.services.editorial_evidence import parse_moment, overlaps
 from clip_engine.services.sponsor_policy import SPONSOR_DISCOVERY_RULE
 from clip_engine.services.ai_client import (
+    AiClientError,
+    active_model,
     ai_chat_completion,
     get_ai_client,
     has_credentials,
@@ -125,11 +127,16 @@ KEEP_WHEN_NONE_PASS = 2
 # virality_score is computed from these rather than trusting model arithmetic.
 RUBRIC_DIMENSIONS = ("hook", "standalone", "arc", "quotability", "ending")
 
+# A clip that boundary snapping leaves less than this short of the minimum is padded, not dropped.
+SNAP_SHORTFALL_PAD_MS = 1000
+
+_SEGMENT_NUMBER = 'The N of a [segment N] transcript line, never a time in seconds.'
 MOMENT_SCHEMA = {'type': 'object', 'properties': {
     'topic': {'type': 'string', 'description': 'One specific topic of this moment, not a summary of the whole video.'},
-    'topic_start_segment': {'type': 'integer'}, 'topic_end_segment': {'type': 'integer'},
-    'setup_segment': {'type': 'integer', 'description': 'The source line introducing essential context.'},
-    'payoff_segment': {'type': 'integer', 'description': 'The source line completing the idea or reaction.'},
+    'topic_start_segment': {'type': 'integer', 'description': _SEGMENT_NUMBER},
+    'topic_end_segment': {'type': 'integer', 'description': _SEGMENT_NUMBER},
+    'setup_segment': {'type': 'integer', 'description': 'The source line introducing essential context. ' + _SEGMENT_NUMBER},
+    'payoff_segment': {'type': 'integer', 'description': 'The source line completing the idea or reaction. ' + _SEGMENT_NUMBER},
     'requires_visual_context': {'type': 'boolean'}},
     'required': ['topic', 'topic_start_segment', 'topic_end_segment', 'setup_segment', 'payoff_segment', 'requires_visual_context'],
     'additionalProperties': False}
@@ -145,10 +152,12 @@ MOMENT_DISCOVERY_RULE = (
     'include the actual example and its setup, not just the later explanation of why it matters. '
     'The payoff must complete this specific idea, not merely be the last available line. '
     'Mark requires_visual_context when the point depends on something shown rather than described. '
-    'Speaker labels distinguish voices within a transcription chunk; do not invent identities or merge quoted claims with the host. '
     'A moment may have one overlapping alternative boundary during discovery; it does not count toward the clip limit, '
     'and selection happens after coherence review. '
     'Return an empty clips array if there is no complete supported moment.')
+# Added to the Jev rule only when the transcript has speaker labels (local Whisper gives none).
+SPEAKER_DISCOVERY_RULE = (
+    ' Speaker labels distinguish voices within a transcription chunk; do not invent identities or merge quoted claims with the host.')
 # Without Jev, anchors are only a reasoning aid: they never move or drop a clip.
 MOMENT_HINT_RULE = (
     '\nMOMENT ANCHORS: For each clip, populate moment with a concise topic, the topic_start_segment and topic_end_segment IDs, '
@@ -512,6 +521,8 @@ class IntelligencePlannerService:
         self._jev_enabled = jev_enabled
         clip_request = (clip_request or '').strip()[:MAX_CLIP_REQUEST_CHARS] or None
         self._clip_request = clip_request
+        # Follow-up requests (length repair) report progress through this too.
+        self._progress = progress
         if discovery_feedback is None:
             self.audit = {'requests': []}
         self._discovery_feedback = discovery_feedback
@@ -548,6 +559,9 @@ class IntelligencePlannerService:
                 segments=[], total_clips=0, target_platform=target_platform,
                 insights="Visual-only planning needs at least three sampled frames",
             )
+        # The prompts describe speaker labels and audio events only when the transcript has them.
+        self._transcript_has_speakers = any(segment.speaker_label for segment in transcript)
+        self._transcript_has_events = any(getattr(segment, "audio_events", None) for segment in transcript)
 
         # Calculate effective duration for clip count scaling
         effective_duration_seconds, duration_source = self._resolve_effective_duration_seconds(
@@ -670,6 +684,8 @@ class IntelligencePlannerService:
                 prompt += CLIP_REQUEST_RULE
             if transcript:
                 prompt += MOMENT_DISCOVERY_RULE if jev_enabled else MOMENT_HINT_RULE
+                if jev_enabled and getattr(self, "_transcript_has_speakers", True):
+                    prompt += SPEAKER_DISCOVERY_RULE
             if discovery_feedback is not None:
                 prompt += ('\nSECOND AND FINAL DISCOVERY PASS: Search the listed underexplored intervals for different moments. '
                     'The previous candidates have already been reviewed. Do not repeat or overlap them by more than 5 seconds. '
@@ -746,12 +762,17 @@ class IntelligencePlannerService:
         )
 
         max_attempts = 1 if discovery_feedback is not None else 3
-        tally = _PlanningTally(served_by=model_name)
+        tally = _PlanningTally(served_by=self._requested_model(model_name))
         insights: list[str] = []
         segments: list[ClipPlanSegment] = []
+        # Picks that break the length bounds get one follow-up request. Jev treats length as a
+        # preference, longform plans with skips, and a second discovery pass is already narrow.
+        repairing = bool(transcript) and not jev_enabled and not longform and discovery_feedback is None
         if len(windows) == 1:
             messages, _, _ = messages_for(0)
-            result = await self._request_plan(messages, max_attempts, tally, 2 if discovery_feedback is not None else 1)
+            whole = (transcript[0].start_time_ms, transcript[-1].end_time_ms) if repairing else None
+            result = await self._request_plan(messages, max_attempts, tally, 2 if discovery_feedback is not None else 1,
+                                              repair_span=whole)
             segments, insights = result.segments, [result.insights] if result.insights else []
         else:
             # A local server answers one request at a time; hosted providers take two.
@@ -768,7 +789,8 @@ class IntelligencePlannerService:
                         progress(f"Searching part {part + 1} of {len(windows)} of the video...")
                     messages, _, span = messages_for(part)
                     try:
-                        return await self._request_plan(messages, max_attempts, tally, 1), span
+                        return await self._request_plan(messages, max_attempts, tally, 1,
+                                                        repair_span=span if repairing else None), span
                     except IntelligencePlanningError as e:
                         if not e.retryable:
                             stop.set()  # a bad key or a missing model fails every part: spend no more
@@ -817,6 +839,13 @@ class IntelligencePlannerService:
                 if judged else
                 "The second AI pass could not score every candidate, so clips are ranked by the planner's own scores."
             )
+        # Parts are planned separately, so only the whole set shows a repeated incident or title.
+        # A clip request may ask for several moments of one kind; Jev and longform decide otherwise.
+        if transcript and segments and not jev_enabled and not clip_request and not longform and discovery_feedback is None:
+            if progress and len(segments) >= final_check.MIN_CANDIDATES:
+                progress("Checking the clips for repeats...")
+            segments, notes = await self._final_check(segments, transcript, tally)
+            insights.extend(notes)
         # Automatic picks keep only clips that score well; a clip request and
         # Jev review decide by other means, and longform episodes are few already.
         min_score = (
@@ -905,14 +934,19 @@ class IntelligencePlannerService:
 
     async def _request_plan(
         self, messages: list[dict], max_attempts: int, tally: "_PlanningTally", discovery_pass: int,
+        repair_span: Optional[tuple[int, int]] = None,
     ) -> ClipPlanResponse:
-        """One planner request with retries; usage and cost go into `tally`."""
+        """One planner request with retries; usage and cost go into `tally`.
+
+        With `repair_span` (the searched part, in ms), picks whose length breaks the
+        bounds get one follow-up request before they are bounded (_repair_lengths).
+        """
         model_name = self.settings.planner_model
         fallback_models = self.settings.get_planner_fallback_models()
         for attempt in range(max_attempts):
             tally.attempts += 1
             parameters = self._build_request_payload(model_name, fallback_models, messages)
-            record = {'discovery_pass': discovery_pass, 'model': model_name, 'requested_model': model_name,
+            record = {'discovery_pass': discovery_pass, 'model': self._requested_model(model_name), 'requested_model': self._requested_model(model_name),
                 'request_parameters': json.dumps({k: v for k, v in parameters.items() if k != 'messages'}),
                 'status': 'unavailable', 'messages': [
                 {'role': m['role'], 'content': m['content'] if isinstance(m['content'], str) else [
@@ -925,13 +959,16 @@ class IntelligencePlannerService:
                     fallback_models=fallback_models,
                     messages=messages,
                 )
-                served_by = self._count_usage(tally, response, usage_data, model_name)
+                served_by = self._count_usage(tally, response, usage_data, self._requested_model(model_name))
                 tally.served_by = served_by
                 record.update(model=served_by, status='received', response=message_text(response)[0], usage=usage_data)
 
-                result = self._parse_clip_plan_response(response)
+                clips_data, insights = self._parse_plan_payload(response)
+                if repair_span is not None:
+                    clips_data = await self._repair_lengths(clips_data, repair_span, tally, discovery_pass)
+                plan = self._plan_from_data(clips_data, insights)
                 record['status'] = 'parsed'
-                return result
+                return plan
             except IntelligencePlanningError as e:
                 if not e.retryable or attempt == max_attempts - 1:
                     logger.error(f"Clip planning failed after {attempt + 1} attempt(s): {e}")
@@ -942,6 +979,121 @@ class IntelligencePlannerService:
                 )
                 await asyncio.sleep(delay)
         raise IntelligencePlanningError("Clip planning made no attempt")
+
+    def _requested_model(self, openrouter_model: str) -> str:
+        """The model a request asks for: the OpenRouter id, or the chosen model of another provider."""
+        if uses_openrouter(self.settings):
+            return openrouter_model
+        try:
+            return active_model(self.settings)
+        except AiClientError:
+            return openrouter_model
+
+    async def _final_check(
+        self, segments: list[ClipPlanSegment], transcript: list[TranscriptSegment], tally: "_PlanningTally",
+    ) -> tuple[list[ClipPlanSegment], list[str]]:
+        """One request over the whole set: repeated incidents and repeated titles (final_check).
+
+        Never fails the plan: a failed or unusable answer leaves the set as it was.
+        """
+        if len(segments) < final_check.MIN_CANDIDATES:
+            return segments, []
+        best = sorted(segments, key=lambda c: c.virality_score, reverse=True)[:final_check.MAX_CANDIDATES]
+        shown = sorted(best, key=lambda c: c.start_time_ms)
+        messages = final_check.messages(shown, transcript)
+        model_name = self.settings.planner_model
+        fallback_models = self.settings.get_planner_fallback_models()
+        response_format = json_schema_format("clip_set_check", final_check.SCHEMA)
+        record = {'discovery_pass': 1, 'kind': 'final_check', 'model': self._requested_model(model_name), 'requested_model': self._requested_model(model_name),
+            'request_parameters': json.dumps({k: v for k, v in self._build_request_payload(
+                model_name, fallback_models, messages, response_format).items() if k != 'messages'}),
+            'status': 'unavailable', 'messages': messages, 'response': None, 'usage': None}
+        self.audit['requests'].append(record)
+        tally.attempts += 1
+        try:
+            response, usage_data = await self._call_openrouter(
+                model=model_name, messages=messages, fallback_models=fallback_models, response_format=response_format,
+            )
+            served_by = self._count_usage(tally, response, usage_data, self._requested_model(model_name))
+            record.update(model=served_by, status='received', response=message_text(response)[0], usage=usage_data)
+            dropped, titles, applied = final_check.apply(shown, message_text(response)[0] or "")
+            record['status'] = 'parsed'
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Final clip check failed ({type(e).__name__}); keeping the set as it was")
+            return segments, []
+        notes = []
+        if applied:
+            notes.append(f"Left out {len(applied)} clip{'s' if len(applied) != 1 else ''} repeating another clip's incident: " + "; ".join(
+                f'"{shown[drop].summary or "untitled"}" (same as "{shown[keep].summary or "untitled"}")' for drop, keep in applied))
+        for at, title in titles.items():
+            shown[at].summary = title
+        if titles:
+            notes.append(f"Renamed {len(titles)} title{'s' if len(titles) != 1 else ''} that repeated another title's wording.")
+        logger.info(f"Final clip check: {len(applied)} repeated incident(s) left out, {len(titles)} title(s) renamed")
+        left_out = {id(shown[i]) for i in dropped}
+        return [c for c in segments if id(c) not in left_out], notes
+
+    async def _repair_lengths(
+        self, clips_data: list, span_ms: tuple[int, int], tally: "_PlanningTally", discovery_pass: int,
+    ) -> list:
+        """Ask once for picks that break the length bounds, at an allowed length (length_repair).
+
+        Never fails the plan: a failed or unusable answer keeps the picks as they were.
+        """
+        min_s, max_s = self._current_min_duration, self._current_max_duration
+        broken = length_repair.violators(clips_data, min_s, max_s)
+        if not broken:
+            return clips_data
+        progress = getattr(self, "_progress", None)
+        if progress:
+            progress(f"Fixing the length of {len(broken)} planned clip{'s' if len(broken) != 1 else ''}...")
+        transcript = self._current_transcript
+        part = (span_ms[0] / 1000, span_ms[1] / 1000)
+        windows = length_repair.context_windows(clips_data, broken, part)
+        lines = "\n".join(
+            self._build_transcript_text([segment], start_index=index)
+            for index, segment in enumerate(transcript)
+            if any(segment.end_time_ms > start * 1000 and segment.start_time_ms < end * 1000 for start, end in windows)
+        )
+        clip_request = getattr(self, "_clip_request", None)
+        messages = length_repair.messages(clips_data, broken, min_s, max_s, lines, clip_request=clip_request)
+        model_name = self.settings.planner_model
+        fallback_models = self.settings.get_planner_fallback_models()
+        response_format = json_schema_format("clip_length_repair", length_repair.SCHEMA)
+        record = {'discovery_pass': discovery_pass, 'kind': 'repair', 'model': self._requested_model(model_name), 'requested_model': self._requested_model(model_name),
+            'request_parameters': json.dumps({k: v for k, v in self._build_request_payload(
+                model_name, fallback_models, messages, response_format).items() if k != 'messages'}),
+            'status': 'unavailable', 'messages': messages, 'response': None, 'usage': None}
+        self.audit['requests'].append(record)
+        tally.attempts += 1
+        try:
+            response, usage_data = await self._call_openrouter(
+                model=model_name, messages=messages, fallback_models=fallback_models, response_format=response_format,
+            )
+            served_by = self._count_usage(tally, response, usage_data, self._requested_model(model_name))
+            record.update(model=served_by, status='received', response=message_text(response)[0], usage=usage_data)
+            repaired, counts = length_repair.apply(
+                clips_data, broken, message_text(response)[0] or "", min_s, max_s, part,
+                allow_drops=not clip_request)
+            record['status'] = 'parsed'
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # A second request for lengths never costs the part its picks.
+            logger.warning(f"Length repair failed ({type(e).__name__}); keeping the planner's picks")
+            return clips_data
+        originals = {id(clip) for clip in clips_data}
+        for clip in repaired:
+            if id(clip) not in originals:
+                times = length_repair.span(clip)
+                clip["emphasis"] = length_repair.spoken_emphasis(clip.get("emphasis"), transcript, *times)
+        logger.info(
+            f"Length repair for {len(broken)} pick(s) outside {min_s}-{max_s}s: "
+            f"{counts['repaired']} repaired, {counts['dropped']} left out, {counts['unchanged']} unchanged"
+        )
+        return repaired
 
     def _count_usage(self, tally: "_PlanningTally", response: dict, usage_data: dict, model_name: str) -> str:
         """Adds one response's tokens and cost to `tally`; returns the model that served it."""
@@ -1010,7 +1162,8 @@ class IntelligencePlannerService:
 
         async def judge(group: list[int]) -> Optional[dict[int, tuple[float, str]]]:
             messages = clip_judge.messages(
-                [((pool[i].end_time_ms - pool[i].start_time_ms) / 1000, texts[i]) for i in group])
+                [((pool[i].end_time_ms - pool[i].start_time_ms) / 1000, texts[i]) for i in group],
+                speakers=getattr(self, "_transcript_has_speakers", True), events=getattr(self, "_transcript_has_events", True))
             async with slots:
                 for attempt in range(clip_judge.MAX_ATTEMPTS):
                     if stop.is_set():
@@ -1021,7 +1174,7 @@ class IntelligencePlannerService:
                             model=model_name, messages=messages, fallback_models=fallback_models,
                             response_format=response_format,
                         )
-                        self._count_usage(tally, response, usage_data, model_name)
+                        self._count_usage(tally, response, usage_data, self._requested_model(model_name))
                         found = clip_judge.parse_judgments(message_text(response)[0] or "", len(group))
                         if found is not None:
                             return found
@@ -1054,6 +1207,36 @@ class IntelligencePlannerService:
                 clip._unscored = False
         logger.info(f"Clip judge scored {len(pool)} candidates in {len(groups)} request(s)")
         return pool, len(pool)
+
+    def _transcript_format(self, longform: bool = False) -> str:
+        """How a transcript line reads, describing only the parts this transcript has.
+
+        Local Whisper gives no speaker labels or audio events; describing them anyway
+        tells the model to look for evidence that is never there.
+        """
+        speakers = getattr(self, "_transcript_has_speakers", True)
+        events = getattr(self, "_transcript_has_events", True)
+        shape = "[segment N] [start - end] " + ("(speaker) " if speakers else "") + "text" + (" (audio events)" if events else "")
+        lines = [
+            f"Each transcript line is `{shape}`, with times in seconds. N is the line's number: the moment fields "
+            "(topic_start_segment, topic_end_segment, setup_segment, payoff_segment) take these numbers, never times. "
+            "start_time and end_time take the times."
+        ]
+        if longform:
+            if speakers:
+                lines.append("Speaker labels (such as S1, or C1S1 in a long recording) mark turns.")
+            if events:
+                lines.append("Audio events such as (laughter) or (applause) are real reactions and mark moments that landed.")
+            return " ".join(lines)
+        if speakers:
+            lines.append(
+                "- Speaker labels (such as S1, or C1S1 in a long recording) mark who is talking. Back-and-forth exchanges, pushback, and one person "
+                "reacting to another are strong clip material — but a clip must still make sense without knowing who the speakers are.")
+        if events:
+            lines.append(
+                "- Audio events such as (laughter) or (applause) are real reactions captured in the audio. They are strong "
+                "evidence that a moment landed; weigh them heavily, and make sure the clip includes the setup that caused the reaction.")
+        return "\n".join(lines)
 
     def _build_system_prompt(
         self,
@@ -1108,12 +1291,12 @@ class IntelligencePlannerService:
                 "- NO OVERLAP: No two clips should share more than 5 seconds of content. "
                 "If two great moments are adjacent, pick the stronger one."
             )
-            title_rules = """- Use curiosity gaps: "Why Most Developers Get This Wrong", "The Truth About AI Coding"
-- Use power words when appropriate: "brutal", "insane", "secret", "truth", "nobody", "actual"
+            # No example titles or word lists here: models copy them into every title.
+            title_rules = """- Name something specific that is said or happens in this clip: a person, a number, a claim, an event or a reaction
+- Use words that would only fit this clip. No stock clickbait templates and no filler intensifiers
 - Match the speaker's energy — if they are calm and analytical, do NOT use hyperbolic clickbait
 - NEVER use generic titles: "Great Advice", "Important Point", "Good Tip", "Interesting Thought"
-- Each title across all clips must be unique — no repeated words or patterns
-- Think: would this title make someone stop scrolling on TikTok?"""
+- Each title across all clips must be unique — no repeated words or patterns"""
             judge_keep = getattr(self, "_judge_keep", None)
             output_count = (
                 f"Return up to {clip_count} clips that match the user clip request as JSON:"
@@ -1158,9 +1341,7 @@ Include your content type classification in the "insights" field.
 
 ## TRANSCRIPT FORMAT
 
-Each transcript line is `[start - end] (speaker) text (audio events)`, with times in seconds.
-- Speaker labels (S1, S2, ...) mark who is talking. Back-and-forth exchanges, pushback, and one person reacting to another are strong clip material — but a clip must still make sense without knowing who the speakers are.
-- Audio events such as (laughter) or (applause) are real reactions captured in the audio. They are strong evidence that a moment landed; weigh them heavily, and make sure the clip includes the setup that caused the reaction.
+{self._transcript_format()}
 - In gaming and stream recordings, game audio and music can show up as stray words. Judge the streamer's own speech.
 
 ## EVALUATION RUBRIC
@@ -1186,6 +1367,8 @@ Prioritize clips whose opening matches one of these proven hook patterns:
 - Number/stat: "I made $50K in 30 days doing this." / "97% of people get this wrong."
 - Story opener: "So last week something crazy happened..." / "Let me tell you about the time..."
 - Direct address: "If you're a developer, you need to hear this." / "Stop doing this right now."
+
+These patterns describe how a clip opens. Never copy them into a title.
 
 ## ANTI-PATTERNS — NEVER SELECT CLIPS THAT:
 
@@ -1261,7 +1444,7 @@ Classify the source first (podcast/interview, tutorial, talk, vlog, debate, stre
 
 ## TRANSCRIPT FORMAT
 
-Each transcript line is `[start - end] (speaker) text (audio events)`, with times in seconds. Speaker labels (S1, S2, ...) mark turns. Audio events such as (laughter) or (applause) are real reactions and mark moments that landed.
+{self._transcript_format(longform=True)}
 
 ## WHAT MAKES A GOOD EPISODE
 
@@ -1544,6 +1727,11 @@ Do not overlap clips by more than 5 seconds."""
 
     def _parse_clip_plan_response(self, response: dict) -> ClipPlanResponse:
         """Parse AI provider response into ClipPlanResponse."""
+        clips_data, insights = self._parse_plan_payload(response)
+        return self._plan_from_data(clips_data, insights)
+
+    def _parse_plan_payload(self, response: dict) -> tuple[list, Optional[str]]:
+        """The raw picks and insights of a planner reply. Unreadable replies raise a retryable error."""
         try:
             content, finish_reason = message_text(response)
             if not content:
@@ -1584,21 +1772,9 @@ Do not overlap clips by more than 5 seconds."""
                     insights = json.dumps(insights, ensure_ascii=False)
             
             logger.info(f"Found {len(clips_data)} clips in response before validation")
-            
-            clips = (
-                self._editorial_candidates(clips_data)
-                if getattr(self, '_jev_enabled', False) else
-                self._bounded_clips(clips_data)
-            )
-
-            logger.info(f"Parsed {len(clips)} clips from planner response")
-
-            return ClipPlanResponse(
-                segments=clips,
-                total_clips=len(clips),
-                target_platform=getattr(self, '_current_target_platform', 'tiktok'),
-                insights=insights,
-            )
+            if not isinstance(clips_data, list):
+                raise IntelligencePlanningError("Planner clips are not a list")
+            return clips_data, insights
 
         except IntelligencePlanningError as e:
             e.retryable = True
@@ -1606,6 +1782,30 @@ Do not overlap clips by more than 5 seconds."""
         except Exception as e:
             logger.error(f"Failed to parse clip plan response: {e}")
             raise IntelligencePlanningError(f"Failed to parse clip plan: {e}", retryable=True)
+
+    def _plan_from_data(self, clips_data: list, insights: Optional[str]) -> ClipPlanResponse:
+        """Bounded (or, with Jev, editorial) clips from a planner reply's raw picks."""
+        try:
+            clips = (
+                self._editorial_candidates(clips_data)
+                if getattr(self, '_jev_enabled', False) else
+                self._bounded_clips(clips_data)
+            )
+        except IntelligencePlanningError as e:
+            e.retryable = True
+            raise
+        except Exception as e:
+            logger.error(f"Failed to parse clip plan response: {e}")
+            raise IntelligencePlanningError(f"Failed to parse clip plan: {e}", retryable=True)
+
+        logger.info(f"Parsed {len(clips)} clips from planner response")
+
+        return ClipPlanResponse(
+            segments=clips,
+            total_clips=len(clips),
+            target_platform=getattr(self, '_current_target_platform', 'tiktok'),
+            insights=insights,
+        )
 
     def _bounded_clips(self, clips_data: list) -> list[ClipPlanSegment]:
         """Clips inside the selected range and duration bounds, snapped to sentences.
@@ -1830,6 +2030,17 @@ Do not overlap clips by more than 5 seconds."""
                     transcript, minimum_end_ms, sentence_end_ms,
                 ) == sentence_end_ms:
                     end_time_ms = sentence_end_ms
+            # Snapping a start 30 ms forward or an end 20 ms back must not cost the clip:
+            # with no sentence end to reach, pad the last fraction of a second instead,
+            # finishing a word the padded end would cut into.
+            if 0 < minimum_end_ms - end_time_ms < SNAP_SHORTFALL_PAD_MS and minimum_end_ms <= maximum_end_ms:
+                end_time_ms = minimum_end_ms
+                for segment in transcript:
+                    if segment.start_time_ms < end_time_ms < segment.end_time_ms:
+                        word = next((w for w in segment.words or [] if w.start_time_ms < end_time_ms < w.end_time_ms), None)
+                        if word and word.end_time_ms <= maximum_end_ms:
+                            end_time_ms = word.end_time_ms
+                        break
             if end_time_ms < minimum_end_ms or end_time_ms > maximum_end_ms:
                 logger.warning(
                     "Filtering clip after boundary snapping: duration falls outside %s-%ss",

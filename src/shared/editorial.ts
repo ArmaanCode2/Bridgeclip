@@ -239,7 +239,8 @@ export interface EditAudit {
   version: 1; title: string; duration_ms: number; preferred_range: (number | null)[]; outcome: string
   transcript: { start_ms: number; end_ms: number; text: string; speaker: string | null }[]
   discovery: Record<string, unknown> | null
-  planner: { requests: { discovery_pass: number; model: string; requested_model: string; request_parameters: string | null; status: string; messages: { role: string; content: string }[]; response: string | null; usage: Record<string, number | null> | null }[] }
+  /** `kind` is null for a planning request, or names a follow-up such as "repair" or "final_check". */
+  planner: { omitted_requests: number; requests: { discovery_pass: number; kind: string | null; model: string; requested_model: string; request_parameters: string | null; status: string; messages: { role: string; content: string }[]; response: string | null; usage: Record<string, number | null> | null }[] }
   candidates: { discovery_pass: number; candidate_index: number; title: string; original_interval: [number, number]; clip_index: number | null; status: string; report: EditorialTrace | null }[]
 }
 /**
@@ -248,6 +249,11 @@ export interface EditAudit {
  * at 32 MB when it is read.
  */
 export const MAX_AUDIT_CANDIDATES = 128
+/**
+ * A long source is planned in several parts, each with its own retries and repair, then checked once.
+ * A trace with more keeps the first ones and counts the rest, so the transcript and edits stay readable.
+ */
+export const MAX_AUDIT_PLANNER_REQUESTS = 256
 export function parseEditAudit(value: unknown): EditAudit {
   const v = obj(value), planner = obj(v.planner)
   if (v.version !== 1) throw new Error('Unsupported edit trace')
@@ -256,8 +262,9 @@ export function parseEditAudit(value: unknown): EditAudit {
     preferred_range: list(v.preferred_range, 2, maybeNumber), outcome: str(v.outcome, 80),
     discovery: v.discovery == null ? null : (() => { const d = obj(v.discovery); return { status: str(d.status, 40), search_intervals: list(d.search_intervals, 6, span), previous_candidates: list(d.previous_candidates, MAX_AUDIT_CANDIDATES, (x) => { const c = obj(x); return { interval: span(c.interval), title: str(c.title, 2000), status: str(c.status, 40) } }) } })(),
     transcript: list(v.transcript, 100000, (x) => { const t = obj(x); return { start_ms: num(t.start_ms), end_ms: num(t.end_ms), text: str(t.text, 100000), speaker: t.speaker == null ? null : str(t.speaker, 100) } }),
-    planner: { requests: list(planner.requests, 4, (x) => { const r = obj(x); return {
-      discovery_pass: num(r.discovery_pass ?? 1, 2), model: str(r.model, 160), requested_model: str(r.requested_model ?? r.model, 160),
+    planner: { omitted_requests: Array.isArray(planner.requests) ? Math.max(0, planner.requests.length - MAX_AUDIT_PLANNER_REQUESTS) : 0,
+      requests: list(Array.isArray(planner.requests) ? planner.requests.slice(0, MAX_AUDIT_PLANNER_REQUESTS) : planner.requests, MAX_AUDIT_PLANNER_REQUESTS, (x) => { const r = obj(x); return {
+      discovery_pass: num(r.discovery_pass ?? 1, 2), kind: r.kind == null ? null : str(r.kind, 40), model: str(r.model, 160), requested_model: str(r.requested_model ?? r.model, 160),
       request_parameters: r.request_parameters == null ? null : str(r.request_parameters, 40000), status: str(r.status, 40), response: r.response == null ? null : str(r.response, 1000000),
       messages: list(r.messages, 5, (x) => { const m = obj(x); return { role: str(m.role, 40), content: typeof m.content === 'string' ? str(m.content, 8000000) : list(m.content, 100, (x) => str(obj(x).text, 8000000)).join('\n') } }),
       usage: parseUsage(r.usage) } }) },

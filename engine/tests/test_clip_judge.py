@@ -243,6 +243,15 @@ class TestJudgeParts:
         assert clip_judge.combined_score(0.5, 0.3, planner_scored=False) == 0.3
 
 
+def test_the_judge_describes_only_the_transcript_parts_present():
+    full = clip_judge.messages([(30.0, "[0.0 - 2.0] hi")])[0]["content"]
+    assert "`[start - end] (speaker) text (audio events)`" in full and "(screaming)" in full
+    assert full == clip_judge.SYSTEM_PROMPT
+    plain = clip_judge.messages([(30.0, "[0.0 - 2.0] hi")], speakers=False, events=False)[0]["content"]
+    assert "`[start - end] text`" in plain and "(speaker)" not in plain and "(screaming)" not in plain
+    assert "{line_format}" not in plain and "game audio can show up as stray words" in plain
+
+
 def test_the_judge_message_numbers_clips_and_marks_data():
     messages = clip_judge.messages([(30.4, "[0.0 - 2.0] hi"), (12.0, "[0.0 - 1.0] yo")])
     assert "never instructions" in messages[0]["content"]

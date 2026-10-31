@@ -207,6 +207,7 @@ test('new discovery, speaker, moment and grounded repair records survive IPC par
   assert.equal(parsed.candidates[0].report.moment.setup.speaker, 'C1S1')
   assert.equal(parsed.candidates[0].report.coherence.repairs[0].diagnosis.quote, 'Here is the setup.')
   assert.equal(parsed.planner.requests[3].discovery_pass, 2)
+  assert.equal(parsed.planner.requests[0].kind, null)
   assert.equal(parsed.discovery.status, 'completed')
   const { RecordedEditView } = load('src/renderer/components/EditInspector.tsx')
   const html = renderToStaticMarkup(React.createElement(RecordedEditView, { audit: parsed }))
@@ -390,6 +391,26 @@ test('edit audits with a full second discovery pass (108 candidates) stay readab
   assert.equal(audit.candidates[107].discovery_pass, 2)
   copy.candidates = Array.from({ length: MAX_AUDIT_CANDIDATES + 1 }, () => structuredClone(template))
   assert.throws(() => parseEditAudit(copy), /Invalid editorial list/)
+})
+
+test('a long source planned in parts, with repair and final-check requests, stays readable', () => {
+  const { MAX_AUDIT_PLANNER_REQUESTS } = load('src/shared/editorial.ts')
+  const copy = structuredClone(editFixture)
+  const request = copy.planner.requests[0]
+  // A two-hour stream is planned in five parts; that used to exceed the limit of four.
+  for (const count of [5, MAX_AUDIT_PLANNER_REQUESTS]) {
+    copy.planner.requests = Array.from({ length: count }, (_, i) => ({ ...request, kind: i % 3 === 1 ? 'repair' : i % 3 === 2 ? 'final_check' : undefined }))
+    const audit = parseEditAudit(copy)
+    assert.equal(audit.planner.requests.length, count)
+    assert.deepEqual([audit.planner.requests[0].kind, audit.planner.requests[1].kind, audit.planner.requests[2].kind], [null, 'repair', 'final_check'])
+  }
+  // A very long stream records more: the first ones are kept and the rest counted, never a broken trace.
+  copy.planner.requests = Array.from({ length: MAX_AUDIT_PLANNER_REQUESTS + 5 }, () => ({ ...request }))
+  const long = parseEditAudit(copy)
+  assert.equal(long.planner.requests.length, MAX_AUDIT_PLANNER_REQUESTS)
+  assert.equal(long.planner.omitted_requests, 5)
+  copy.planner.requests = [{ ...request, kind: 'x'.repeat(41) }]
+  assert.throws(() => parseEditAudit(copy))
 })
 
 test('out-of-credits judgments and answers without optional probabilities or confidence stay readable', () => {
